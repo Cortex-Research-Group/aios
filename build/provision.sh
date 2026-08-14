@@ -11,6 +11,7 @@ set -eu
 AIOS_DIR="${AIOS_DIR:-/opt/aios}"
 PAYLOAD="${PAYLOAD:-$(cd "$(dirname "$0")/../root" 2>/dev/null && pwd || echo /tmp/aios-payload)}"
 CONSOLE="${CONSOLE:-1}"   # set 0 to skip the autologin-into-aiOS setup
+BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 
 say() { printf '\033[36m::\033[0m %s\n' "$1"; }
 
@@ -46,8 +47,9 @@ chmod +x "$AIOS_DIR/aios"
 for d in apps memory vault logs data; do mkdir -p "$AIOS_DIR/$d"; done
 chmod 700 "$AIOS_DIR/vault"
 
-ln -sf "$AIOS_DIR/aios" /usr/local/bin/aios
-say "aios is on PATH"
+mkdir -p "$BIN_DIR"
+ln -sf "$AIOS_DIR/aios" "$BIN_DIR/aios"
+say "aios is on PATH ($BIN_DIR/aios)"
 
 # --- console ------------------------------------------------------------------
 # Make aiOS the thing you get when the machine boots, rather than a shell you

@@ -1,9 +1,25 @@
 #!/bin/sh
-# aiOS launcher. Resolves the root from its own location so the tree works
-# unchanged on a USB stick, a VM disk or a VPS.
+# aiOS launcher.
+#
+# Resolves the OS root from its own location, so the tree works unchanged on a
+# USB stick, a VM disk or a VPS. Symlinks are followed to their target first:
+# provisioning puts a link at /usr/local/bin/aios, and $0 there points at the
+# link, not the install. BSD readlink has no -f, so the walk is done by hand.
 set -e
-AIOS_HOME="$(cd "$(dirname "$0")" && pwd)"
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+    LINK="$(readlink "$SELF")"
+    case "$LINK" in
+        /*) SELF="$LINK" ;;
+        *)  SELF="$(dirname "$SELF")/$LINK" ;;
+    esac
+done
+
+AIOS_HOME="${AIOS_HOME:-$(cd "$(dirname "$SELF")" && pwd)}"
 export AIOS_HOME
+
 PY=$(command -v python3 || command -v python || true)
-[ -z "$PY" ] && { echo "aiOS needs python3 on this machine."; exit 1; }
+[ -z "$PY" ] && { echo "aiOS needs python3 on this machine." >&2; exit 1; }
+
 exec "$PY" "$AIOS_HOME/system/aios.py" "$@"
