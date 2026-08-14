@@ -1,0 +1,9 @@
+#!/bin/sh
+# aiOS launcher. Resolves the root from its own location so the tree works
+# unchanged on a USB stick, a VM disk or a VPS.
+set -e
+AIOS_HOME="$(cd "$(dirname "$0")" && pwd)"
+export AIOS_HOME
+PY=$(command -v python3 || command -v python || true)
+[ -z "$PY" ] && { echo "aiOS needs python3 on this machine."; exit 1; }
+exec "$PY" "$AIOS_HOME/system/aios.py" "$@"

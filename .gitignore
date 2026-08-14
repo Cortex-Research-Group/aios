@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/vm/.cache/
+
+# runtime state — the OS's own, never committed
+root/vault/
+root/logs/
+root/apps/
+root/memory/
+root/data/
+root/aios.json
