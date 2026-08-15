@@ -51,7 +51,8 @@ class TestBrainOffline(unittest.TestCase):
         llm.API = self._api
 
     def test_chat_raises_legible_error(self):
-        client = llm.Client("sk-test", "anthropic/claude-opus-5")
+        # Explicit base_url: this suite must never touch the real network.
+        client = llm.Client("sk-test", "anthropic/claude-opus-5", base_url=UNREACHABLE)
         with self.assertRaises(llm.LLMError) as cm:
             client.chat([{"role": "user", "content": "hi"}])
         msg = str(cm.exception)
@@ -59,9 +60,15 @@ class TestBrainOffline(unittest.TestCase):
         self.assertIn("127.0.0.1:1", msg, "the error should name the endpoint it tried")
         self.assertIn("online", msg, "the error should hint at the actual cause")
 
-    def test_key_check_raises_same_way(self):
-        with self.assertRaises(llm.LLMError):
-            llm.OpenRouter("sk-test").check()
+    def test_check_skips_the_network_for_local_endpoints(self):
+        """Self-hosted servers have no /key account endpoint to validate against."""
+        info = llm.Client("", base_url=UNREACHABLE).check()
+        self.assertTrue(info["local"])
+        self.assertEqual(info["base_url"], UNREACHABLE)
+
+    def test_module_constant_override_is_honoured(self):
+        """llm.API must not be frozen into a default argument."""
+        self.assertEqual(llm.Client("k").base_url, UNREACHABLE)
 
     def test_error_is_catchable_as_one_type(self):
         """The shell catches llm.LLMError; AuthError must be a subclass."""

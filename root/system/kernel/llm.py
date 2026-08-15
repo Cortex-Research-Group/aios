@@ -64,11 +64,14 @@ class Client:
     """One turn of chat against any OpenAI-compatible /chat/completions."""
 
     def __init__(self, key: str = "", model: str = DEFAULT_MODEL,
-                 max_tokens: int = DEFAULT_MAX_TOKENS, base_url: str = API):
+                 max_tokens: int = DEFAULT_MAX_TOKENS, base_url: str = ""):
         self.key = key
         self.model = model
         self.max_tokens = max_tokens
-        self.base_url = base_url.rstrip("/")
+        # Resolved at call time, not bound as a default argument: a default
+        # would freeze the module constant at import and silently ignore any
+        # later override of llm.API.
+        self.base_url = (base_url or API).rstrip("/")
 
     @property
     def is_local(self) -> bool:
