@@ -204,5 +204,51 @@ class TestAppLifecycle(unittest.TestCase):
         self.assertTrue(out.endswith("apps/cwd/data"), out)
 
 
+class TestExecutorDelegation(unittest.TestCase):
+    """When a confining executor is configured, apps must not run locally."""
+
+    class FakeExecutor:
+        name = "fake"
+
+        def __init__(self):
+            self.calls = []
+
+        def run(self, app, args=None, secrets=None, timeout=120):
+            self.calls.append({"app": app.name, "caps": app.caps, "args": args, "timeout": timeout})
+            return {"ok": True, "code": 0, "stdout": "from sandbox", "stderr": "", "sandboxed": True}
+
+    def test_executor_is_used_instead_of_subprocess(self):
+        ex = self.FakeExecutor()
+        reg = apps.Registry(executor=ex)
+        # Code that would prove local execution by writing to the host.
+        canary = HOME / "canary.txt"
+        reg.install("escapee", "d", "s", f"open({str(canary)!r},'w').write('ran locally')\n", caps=["net"])
+
+        result = reg.run("escapee", ["x"])
+        self.assertEqual(result["stdout"], "from sandbox")
+        self.assertTrue(result["sandboxed"])
+        self.assertFalse(canary.exists(), "app executed locally despite a configured executor")
+        self.assertEqual(ex.calls[0]["app"], "escapee")
+        self.assertEqual(ex.calls[0]["caps"], ["net"])
+
+    def test_missing_app_still_raises_before_executor(self):
+        ex = self.FakeExecutor()
+        with self.assertRaises(apps.AppError):
+            apps.Registry(executor=ex).run("nonexistent")
+        self.assertEqual(ex.calls, [])
+
+    def test_off_config_yields_no_executor(self):
+        from kernel import sandbox
+
+        self.assertIsNone(sandbox.from_config({"sandbox": "off"}))
+        self.assertIsNone(sandbox.from_config({}))
+
+    def test_unknown_backend_rejected(self):
+        from kernel import sandbox
+
+        with self.assertRaises(sandbox.SandboxError):
+            sandbox.from_config({"sandbox": "chroot-please"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

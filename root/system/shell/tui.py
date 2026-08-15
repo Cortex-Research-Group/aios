@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from kernel import agent, apps, llm, memory, paths, syscalls, vault
+from kernel import agent, apps, llm, memory, paths, sandbox, syscalls, vault
 
 try:
     import readline  # noqa: F401  -- line editing and history, if available
@@ -64,23 +64,40 @@ class Shell:
     def __init__(self):
         paths.ensure()
         self.config = self._load_config()
-        self.registry = apps.Registry()
+        self.registry = apps.Registry(executor=self._build_executor())
         self.memory = memory.Memory()
         self.secrets: dict = {}
         self.kernel = None
+        self.hosted = False
         self._streaming = False
         self._session_allow_all = False
 
     # --- config --------------------------------------------------------------
 
     def _load_config(self) -> dict:
-        default = {"model": llm.DEFAULT_MODEL, "autonomy": "ask"}
+        config = {"model": llm.DEFAULT_MODEL, "autonomy": "ask", "sandbox": "off"}
         if paths.CONFIG.exists():
             try:
-                return {**default, **json.loads(paths.CONFIG.read_text())}
+                config.update(json.loads(paths.CONFIG.read_text()))
             except (json.JSONDecodeError, OSError):
                 pass
-        return default
+        # A hosted deployment picks the sandbox backend; it should not depend on
+        # a config file that lives in a volume the deployment may not have yet.
+        if os.environ.get("AIOS_SANDBOX"):
+            config["sandbox"] = os.environ["AIOS_SANDBOX"]
+        if os.environ.get("AIOS_SANDBOX_VOLUME"):
+            config["sandbox_volume"] = os.environ["AIOS_SANDBOX_VOLUME"]
+        return config
+
+    def _build_executor(self):
+        """The app execution backend. Falls back to subprocesses if unavailable."""
+        try:
+            return sandbox.from_config(self.config)
+        except sandbox.SandboxError as e:
+            print(red(f"  sandbox unavailable: {e}"))
+            print(dim("  falling back to local subprocesses"))
+            self.config["sandbox"] = "off"
+            return None
 
     def _save_config(self) -> None:
         paths.CONFIG.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
@@ -91,13 +108,22 @@ class Shell:
         print(cyan(BANNER))
         print(dim(f"  root   {paths.HOME}"))
 
-        v = vault.Vault()
-        if not v.exists():
-            if not self._first_run(v):
-                return False
+        # Hosted deployments (Modal secrets, VPS env, CI) inject the key directly.
+        # There is nobody at a keyboard to type a passphrase, so the vault is
+        # bypassed and the environment becomes the secret pool. Apps still only
+        # receive the keys they declared.
+        env_key = os.environ.get("OPENROUTER_API_KEY")
+        if env_key:
+            self.secrets = dict(os.environ)
+            self.hosted = True
         else:
-            if not self._unlock(v):
-                return False
+            v = vault.Vault()
+            if not v.exists():
+                if not self._first_run(v):
+                    return False
+            else:
+                if not self._unlock(v):
+                    return False
 
         model = self.config["model"]
         self.client = llm.OpenRouter(self.secrets["OPENROUTER_API_KEY"], model)
@@ -116,8 +142,9 @@ class Shell:
 
         n_apps = len(self.registry.all())
         n_mem = len(self.memory.all())
-        print(dim(f"  brain  {model}"))
-        print(dim(f"  apps   {n_apps}    memory {n_mem} notes    autonomy {self.config['autonomy']}"))
+        print(dim(f"  brain  {model}" + ("   key from environment" if self.hosted else "")))
+        confine = self.registry.executor.name if self.registry.executor else "subprocess"
+        print(dim(f"  apps   {n_apps}    memory {n_mem} notes    autonomy {self.config['autonomy']}    apps run in: {confine}"))
         print(dim("  type /help for commands, or just say what you want\n"))
         return True
 
@@ -291,6 +318,7 @@ class Shell:
   {bold('/model [id]')}       show or change the brain
   {bold('/models [filter]')}  browse available models
   {bold('/autonomy [mode]')}  ask | full | readonly
+  {bold('/sandbox [mode]')}    off | modal -- where generated apps run
   {bold('/syscalls')}         list kernel syscalls
   {bold('/reset')}            clear the conversation, keep apps and memory
   {bold('/exit')}             halt
@@ -360,6 +388,17 @@ class Shell:
                 print(green(f"  autonomy: {arg}\n"))
             else:
                 print(f"  {self.config['autonomy']} " + dim("(ask | full | readonly)\n"))
+
+        elif cmd == "sandbox":
+            if arg in ("off", "modal"):
+                self.config["sandbox"] = arg
+                self._save_config()
+                self.registry.executor = self._build_executor()
+                where = self.registry.executor.name if self.registry.executor else "local subprocesses"
+                print(green(f"  apps now run in: {where}\n"))
+            else:
+                where = self.registry.executor.name if self.registry.executor else "subprocess"
+                print(f"  {where} " + dim("(off | modal)\n"))
 
         elif cmd == "syscalls":
             for s in syscalls.REGISTRY.values():

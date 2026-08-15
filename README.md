@@ -39,9 +39,28 @@ The `root/` tree *is* the OS. Copy it anywhere; it never writes outside itself.
 | Target | How | Why |
 |---|---|---|
 | **This machine** | `./root/aios` | Fastest way to use it. |
-| **Local VM** | `./build/vm/run-vm.sh -d` then `./build/deploy.sh` | Real Alpine boot, disposable. The dev loop for the bootable target. |
+| **Modal** | `modal run build/modal/aios_modal.py` | Persistent state on a Volume, and **real confinement** for generated apps. |
 | **VPS** | `./build/deploy.sh root@your-host` | Always-on. Your OS lives at an IP and keeps running when the laptop sleeps. |
+| **Local VM** | `./build/vm/run-vm.sh -d` then `./build/deploy.sh` | Disposable Alpine boot. *Untested — needs a qemu that builds on your host.* |
 | **USB stick** | copy `root/` to the drive, run `./aios` | Portable. Bare-metal boot is the next milestone. |
+
+### Modal
+
+```sh
+modal secret create openrouter-api-key OPENROUTER_API_KEY=sk-or-...   # once
+modal run build/modal/aios_modal.py            # interactive session
+modal run build/modal/aios_modal.py::status    # what the volume holds
+modal run build/modal/aios_modal.py::selftest  # prove caps are enforced
+```
+
+State lives on the `aios-root` Volume, so the OS you grow in one session is the
+one you return to. The key comes from a Modal Secret, so there is no passphrase
+prompt — aiOS bypasses the vault whenever `OPENROUTER_API_KEY` is already in the
+environment.
+
+The tradeoff is honest: Modal is serverless, so this is **not** an always-on box
+at an IP. You get a container when you ask and it stops when you leave. What you
+get in return is free compute, persistent state, and the sandbox below.
 
 ### Local VM
 
@@ -79,6 +98,7 @@ root/                     the entire OS — this tree is the deliverable
 │   │   ├── syscalls.py   every primitive the model may invoke. the security boundary.
 │   │   ├── apps.py       userland registry — install, version, run
 │   │   ├── memory.py     markdown facts + TF-IDF search
+│   │   ├── sandbox.py    optional confined execution (Modal), lazily imported
 │   │   ├── vault.py      ChaCha20 + scrypt secret storage
 │   │   ├── llm.py        OpenRouter client (streaming, tool calls)
 │   │   └── paths.py      the root, and the jail check
@@ -124,11 +144,20 @@ The agent writes code nobody reviewed, so the boundaries are explicit:
 - **Vault** — scrypt-derived key, ChaCha20, encrypt-then-MAC with HMAC-SHA256.
   Verified against the RFC 8439 test vectors in `tests/test_vault.py`.
 
-Honest limits: a generated app runs as a normal subprocess. The capability manifest
-is *disclosure and key isolation*, not a sandbox — an app with `proc` can do what
-your user account can do. Real confinement needs the Linux targets (`unshare`,
-seccomp), which is why the VM and VPS paths matter beyond convenience. Run untrusted
-prompts in the VM, not on your laptop.
+**Where apps actually run** decides whether that manifest is enforcement or just
+paperwork:
+
+| `/sandbox` | Backend | What a capability means |
+|---|---|---|
+| `off` (default) | local subprocess | Disclosure + key isolation. An app with `proc` can do whatever your user account can. |
+| `modal` | `modal.Sandbox` | Enforcement. No `net` → `block_network=True` and the container has no route out. No `fs` → no volume mounted. Plus hard cpu/memory/timeout ceilings. |
+
+`kernel/sandbox.py` imports `modal` lazily and only when selected, so the stick,
+the VPS and the VM keep their zero-dependency guarantee.
+
+So: run adventurous prompts with `/sandbox modal`, not on your laptop. The local
+default is fine for code you'd have written yourself, and honest about being a
+disclosure mechanism rather than a jail.
 
 ## Syscalls
 
@@ -147,5 +176,6 @@ prompts in the VM, not on your laptop.
 python3 -m unittest discover -s tests -v
 ```
 
-31 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
-filesystem jail, the permission gate, memory ranking, and the app lifecycle.
+46 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
+filesystem jail, the permission gate, memory ranking, the app lifecycle, the
+kernel loop against a scripted model, and executor delegation.

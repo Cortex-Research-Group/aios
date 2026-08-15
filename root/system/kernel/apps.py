@@ -67,9 +67,12 @@ class App:
 
 
 class Registry:
-    def __init__(self, root: Path | None = None):
+    def __init__(self, root: Path | None = None, executor=None):
         self.root = Path(root) if root else paths.APPS
         self.root.mkdir(parents=True, exist_ok=True)
+        # None runs apps as local subprocesses; an executor confines them.
+        # See kernel/sandbox.py.
+        self.executor = executor
 
     # --- reading -------------------------------------------------------------
 
@@ -174,6 +177,9 @@ class Registry:
             raise AppError(f"no such app: {name}")
         if not app.entry.exists():
             raise AppError(f"app {name} has no main.py")
+
+        if self.executor is not None:
+            return self.executor.run(app, args or [], secrets=secrets, timeout=timeout)
 
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
