@@ -51,11 +51,12 @@ class TestBrainOffline(unittest.TestCase):
         llm.API = self._api
 
     def test_chat_raises_legible_error(self):
-        client = llm.OpenRouter("sk-test", "anthropic/claude-opus-5")
+        client = llm.Client("sk-test", "anthropic/claude-opus-5")
         with self.assertRaises(llm.LLMError) as cm:
             client.chat([{"role": "user", "content": "hi"}])
         msg = str(cm.exception)
-        self.assertIn("cannot reach OpenRouter", msg)
+        self.assertIn("cannot reach", msg)
+        self.assertIn("127.0.0.1:1", msg, "the error should name the endpoint it tried")
         self.assertIn("online", msg, "the error should hint at the actual cause")
 
     def test_key_check_raises_same_way(self):

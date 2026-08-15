@@ -29,20 +29,43 @@ root_volume = modal.Volume.from_name("aios-root", create_if_missing=True)
 # misbehaving app cannot reach the vault.
 app_data = modal.Volume.from_name("aios-app-data", create_if_missing=True)
 
-# modal is installed so the kernel can use the Sandbox executor from inside.
-image = modal.Image.debian_slim(python_version="3.12").pip_install("modal")
+def _with_payload(img):
+    """Attach the aiOS tree to an image.
 
-# This module is re-imported inside the container, where __file__ lives at
-# /root/aios_modal.py and has no grandparent -- resolving the payload path
-# unconditionally crashes every container on import. The local tree only needs
-# to be located when the image is being defined, which only happens locally.
-if modal.is_local():
-    PAYLOAD = Path(__file__).resolve().parents[2] / "root"
-    image = (
-        image
-        .add_local_dir(PAYLOAD / "system", remote_path="/opt/aios-system")
-        .add_local_file(PAYLOAD / "aios", remote_path="/opt/aios-launcher")
+    This module is re-imported inside the container, where __file__ lives at
+    /root/aios_modal.py and has no grandparent -- resolving the payload path
+    unconditionally crashes every container on import. The local tree only needs
+    to be located when the image is being defined, which only happens locally.
+    """
+    if not modal.is_local():
+        return img
+    payload = Path(__file__).resolve().parents[2] / "root"
+    return (
+        img
+        .add_local_dir(payload / "system", remote_path="/opt/aios-system")
+        .add_local_file(payload / "aios", remote_path="/opt/aios-launcher")
     )
+
+
+# modal is installed so the kernel can use the Sandbox executor from inside.
+image = _with_payload(modal.Image.debian_slim(python_version="3.12").pip_install("modal"))
+
+# --- local brain --------------------------------------------------------------
+# A GPU image serving an open-weights model over an OpenAI-compatible endpoint.
+# aiOS needs no new code path for this: llm.Client just points base_url at
+# localhost instead of openrouter.ai.
+
+LOCAL_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+VLLM_PORT = 8000
+
+vllm_image = _with_payload(
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("vllm", "huggingface_hub[hf_transfer]", "modal")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "VLLM_USE_V1": "1"})
+)
+
+# Model weights are ~15GB; cache them so only the first run pays the download.
+hf_cache = modal.Volume.from_name("aios-hf-cache", create_if_missing=True)
 
 # Must expose OPENROUTER_API_KEY. Create with:
 #   modal secret create openrouter-api-key OPENROUTER_API_KEY=sk-or-...
@@ -244,6 +267,128 @@ def smoke(prompt: str = ""):
         return
     print("\n" + "-" * 70)
     print(f"FINAL REPLY:\n{final}")
+
+    root_volume.commit()
+
+
+@app.function(
+    image=vllm_image,
+    volumes={AIOS_HOME: root_volume, "/root/.cache/huggingface": hf_cache},
+    gpu="A10G",
+    timeout=3600,
+)
+def local_brain(prompt: str = ""):
+    """Run the same agent loop on a self-hosted open-weights model.
+
+    Answers the question a hosted brain cannot: can aiOS think without calling
+    out to anyone? Serves LOCAL_MODEL over vLLM's OpenAI-compatible endpoint on
+    localhost and points the kernel at it. Nothing in the kernel changes -- only
+    base_url.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    os.environ["AIOS_HOME"] = AIOS_HOME
+    _sync_system()
+    sys.path.insert(0, f"{AIOS_HOME}/system")
+
+    from kernel import agent, llm
+    from kernel import apps as kapps
+    from kernel import memory as kmem
+
+    base = f"http://127.0.0.1:{VLLM_PORT}/v1"
+    print(f"serving {LOCAL_MODEL} on {base}")
+
+    # Keep the server log: when vLLM refuses to start, its stderr is the only
+    # thing that explains why, and discarding it wastes a whole GPU run.
+    log_path = "/tmp/vllm.log"
+    log = open(log_path, "w")
+
+    def server_log(n=40):
+        log.flush()
+        try:
+            return "".join(open(log_path).readlines()[-n:])
+        except OSError:
+            return "(no log)"
+
+    server = subprocess.Popen(
+        [
+            "vllm", "serve", LOCAL_MODEL,
+            "--port", str(VLLM_PORT),
+            "--max-model-len", "16384",
+            "--gpu-memory-utilization", "0.90",
+            # Without these vLLM returns tool calls as prose and the kernel
+            # never sees a syscall.
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "hermes",
+        ],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+
+    t0 = time.time()
+    for _ in range(180):
+        if server.poll() is not None:
+            print(f"FAILED: vLLM exited with code {server.returncode}\n")
+            print(server_log(50))
+            return
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{VLLM_PORT}/health", timeout=3)
+            break
+        except (urllib.error.URLError, OSError):
+            time.sleep(5)
+    else:
+        print("FAILED: vLLM never became healthy\n")
+        print(server_log(50))
+        server.terminate()
+        return
+    print(f"model ready in {time.time() - t0:.0f}s\n")
+
+    prompt = prompt or (
+        "Build an app called 'dice' that rolls N six-sided dice, where N is the "
+        "first argument and defaults to 1, and prints each roll and the total. "
+        "Then run it with 3 to prove it works."
+    )
+
+    def emit(kind, data):
+        if kind == "token":
+            print(data["text"], end="", flush=True)
+        elif kind == "syscall":
+            args = {k: (str(v)[:60] + "…" if len(str(v)) > 60 else v) for k, v in data["args"].items()}
+            print(f"\n  · {data['name']}({args})", flush=True)
+        elif kind == "result":
+            print(f"    -> {data['output'][:300]}", flush=True)
+
+    # Apps run as local subprocesses here: nesting Modal sandboxes inside a GPU
+    # container buys nothing for this test and costs GPU seconds.
+    ctx = agent.Context(
+        registry=kapps.Registry(),
+        memory=kmem.Memory(),
+        secrets={},
+        model=LOCAL_MODEL,
+        autonomy="full",
+        emit=emit,
+    )
+    client = llm.Client(key="", model=LOCAL_MODEL, base_url=base, max_tokens=4096)
+
+    print(f"prompt: {prompt}\n" + "-" * 70)
+    t1 = time.time()
+    try:
+        final = agent.Kernel(client, ctx).turn(prompt)
+    except llm.LLMError as e:
+        print(f"\nLOCAL BRAIN FAILED: {e}")
+        return
+    finally:
+        server.terminate()
+
+    elapsed = time.time() - t1
+    print("\n" + "-" * 70)
+    print(f"FINAL REPLY:\n{final}")
+    print(f"\nwall clock for the whole turn: {elapsed:.1f}s  (no network calls left this container)")
 
     root_volume.commit()
 

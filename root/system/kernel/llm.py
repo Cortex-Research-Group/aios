@@ -1,11 +1,14 @@
-"""OpenRouter client.
+"""Chat client for any OpenAI-compatible endpoint.
 
-stdlib urllib only -- no requests, no openai package. One key, ~300 models, and
-the brain is swappable at runtime with /model.
+stdlib urllib only -- no requests, no openai package. Defaults to OpenRouter
+(one key, ~300 models, swap brains at runtime with /model), but the same wire
+format is spoken by llama.cpp's server, vLLM, Ollama and friends, so pointing
+base_url at a locally hosted model needs no new code path -- see kernel/brain.py.
 """
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://openrouter.ai/api/v1"
@@ -29,7 +32,8 @@ class AuthError(LLMError):
 
 def _request(url: str, key: str, payload: dict | None = None, stream: bool = False):
     headers = {
-        "Authorization": f"Bearer {key}",
+        # Local servers ignore auth; sending a placeholder keeps one code path.
+        "Authorization": f"Bearer {key or 'none'}",
         "Content-Type": "application/json",
         # OpenRouter attributes traffic with these; they are optional but polite.
         "HTTP-Referer": "https://github.com/aios",
@@ -47,26 +51,40 @@ def _request(url: str, key: str, payload: dict | None = None, stream: bool = Fal
             msg = body[:400] or e.reason
         if e.code in (401, 403):
             raise AuthError(f"OpenRouter rejected the key: {msg}") from None
-        raise LLMError(f"OpenRouter {e.code}: {msg}") from None
+        raise LLMError(f"HTTP {e.code} from {_host(url)}: {msg}") from None
     except urllib.error.URLError as e:
-        raise LLMError(f"cannot reach OpenRouter ({e.reason}) -- is this machine online?") from None
+        raise LLMError(f"cannot reach {_host(url)} ({e.reason}) -- is this machine online?") from None
 
 
-class OpenRouter:
-    def __init__(self, key: str, model: str = DEFAULT_MODEL, max_tokens: int = DEFAULT_MAX_TOKENS):
+def _host(url: str) -> str:
+    return urllib.parse.urlparse(url).netloc or url
+
+
+class Client:
+    """One turn of chat against any OpenAI-compatible /chat/completions."""
+
+    def __init__(self, key: str = "", model: str = DEFAULT_MODEL,
+                 max_tokens: int = DEFAULT_MAX_TOKENS, base_url: str = API):
         self.key = key
         self.model = model
         self.max_tokens = max_tokens
+        self.base_url = base_url.rstrip("/")
+
+    @property
+    def is_local(self) -> bool:
+        return "openrouter.ai" not in self.base_url
 
     # --- account -------------------------------------------------------------
 
     def check(self) -> dict:
-        """Validate the key. Returns OpenRouter's account info."""
-        with _request(f"{API}/key", self.key) as r:
+        """Validate the key. OpenRouter-only; local servers have no accounts."""
+        if self.is_local:
+            return {"local": True, "base_url": self.base_url}
+        with _request(f"{self.base_url}/key", self.key) as r:
             return json.loads(r.read()).get("data", {})
 
     def models(self) -> list:
-        with _request(f"{API}/models", self.key) as r:
+        with _request(f"{self.base_url}/models", self.key) as r:
             return json.loads(r.read()).get("data", [])
 
     # --- inference -----------------------------------------------------------
@@ -93,7 +111,7 @@ class OpenRouter:
         finish_reason = None
         usage = {}
 
-        with _request(f"{API}/chat/completions", self.key, payload, stream=True) as resp:
+        with _request(f"{self.base_url}/chat/completions", self.key, payload, stream=True) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
                 # OpenRouter emits ": OPENROUTER PROCESSING" keepalive comments.
@@ -145,3 +163,7 @@ class OpenRouter:
             "finish_reason": finish_reason,
             "usage": usage,
         }
+
+
+# The class was called OpenRouter before it learned to talk to local servers.
+OpenRouter = Client
