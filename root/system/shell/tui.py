@@ -334,7 +334,7 @@ class Shell:
   {bold('/models [filter]')}  browse available models
   {bold('/autonomy [mode]')}  ask | full | readonly
   {bold('/sandbox [mode]')}    off | modal -- where generated apps run
-  {bold('/world [train]')}     predict what a syscall will do before running it
+  {bold('/world [bootstrap|train]')}  predict a syscall's effect before running it
   {bold('/syscalls')}         list kernel syscalls
   {bold('/reset')}            clear the conversation, keep apps and memory
   {bold('/exit')}             halt
@@ -433,6 +433,16 @@ class Shell:
                     print(yellow(f"  under {world.MIN_SAMPLES} samples: treat predictions as a hint\n"))
                 else:
                     print()
+            elif arg == "bootstrap":
+                print(dim("  practising in a throwaway root (creation and deletion)..."))
+                samples = world.bootstrap()
+                samples += world.load_transitions()  # plus whatever you actually did
+                stats = self.world.fit(samples)
+                self.world.save()
+                self.ctx.world_model = self.world
+                print(green(f"  trained on {stats['samples']} transitions"))
+                print(dim(f"  rmse {stats['rmse']:.4f}   vs do-nothing baseline {stats['vs_static']:.3f}\n"))
+
             elif arg == "forget":
                 self.world = world.WorldModel()
                 self.world.save()
@@ -445,7 +455,10 @@ class Shell:
                           + dim(f"({'reliable' if self.world.is_reliable else 'under-trained'})"))
                 else:
                     print(dim("  no world model yet"))
-                print(dim(f"  {pending} transitions journaled    /world train | /world forget\n"))
+                print(dim(f"  {pending} transitions journaled"))
+                print(dim("  /world bootstrap  learn by practising, deletions included"))
+                print(dim("  /world train      learn from journalled usage only"))
+                print(dim("  /world forget     discard the model\n"))
 
         elif cmd == "syscalls":
             for s in syscalls.REGISTRY.values():
