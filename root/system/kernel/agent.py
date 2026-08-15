@@ -14,6 +14,52 @@ from . import paths, syscalls
 
 MAX_STEPS = 25  # a runaway tool loop should stall, not bill you forever
 
+_CONTROL = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+
+
+def repair_json(raw: str) -> str:
+    """Escape raw control characters that appear inside JSON string literals.
+
+    Smaller models routinely emit tool arguments containing a literal newline
+    inside a quoted string -- which is invalid JSON -- and it happens most often
+    on exactly the call that matters here, app_build, because that one carries a
+    whole program as a string. Rejecting those outright makes weak models
+    unusable for the OS's central feature, so repair the common case instead.
+    """
+    out = []
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        out.append(_CONTROL[ch] if (in_string and ch in _CONTROL) else ch)
+    return "".join(out)
+
+
+def parse_args(raw: str) -> tuple[dict, str | None]:
+    """Parse tool-call arguments, repairing them if needed.
+
+    Returns (args, repaired_raw). repaired_raw is None when no repair was
+    needed; when it is set the caller must store it back on the assistant
+    message, or the next request replays the malformed JSON and the server
+    rejects the whole conversation.
+    """
+    try:
+        return json.loads(raw or "{}"), None
+    except json.JSONDecodeError:
+        fixed = repair_json(raw)
+        return json.loads(fixed), fixed  # may raise; caller handles
+
 SYSTEM_PROMPT = """You are aiOS, an operating system whose userland is written by you, on demand.
 
 You run from a portable root directory that may live on a USB stick, a VM disk or a VPS.
@@ -145,9 +191,18 @@ class Kernel:
             for call in reply["tool_calls"]:
                 name = call["function"]["name"]
                 try:
-                    args = json.loads(call["function"]["arguments"] or "{}")
+                    args, repaired = parse_args(call["function"]["arguments"])
+                    if repaired is not None:
+                        # Store the repair, so the next request does not replay
+                        # invalid JSON and get the whole conversation rejected.
+                        call["function"]["arguments"] = repaired
+                        self.ctx.emit("repaired", name=name)
                 except json.JSONDecodeError as e:
                     args, out = {}, f"error: arguments were not valid JSON ({e})"
+                    # Unsalvageable: replace it so the malformed JSON is not
+                    # replayed on the next request. The model sees the error in
+                    # the tool result and can retry properly.
+                    call["function"]["arguments"] = "{}"
                 else:
                     self.ctx.emit("syscall", name=name, args=args)
                     out = syscalls.dispatch(name, args, self.ctx)

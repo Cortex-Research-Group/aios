@@ -61,7 +61,14 @@ VLLM_PORT = 8000
 vllm_image = _with_payload(
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("vllm", "huggingface_hub[hf_transfer]", "modal")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "VLLM_USE_V1": "1"})
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "VLLM_USE_V1": "1",
+        # FlashInfer JIT-compiles its sampling kernel on first use and needs
+        # nvcc, which slim images lack. vLLM's native PyTorch sampler needs no
+        # compiler and is quite fast enough for a 7B interactive agent.
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+    })
 )
 
 # Model weights are ~15GB; cache them so only the first run pays the download.
@@ -308,12 +315,15 @@ def local_brain(prompt: str = ""):
     log_path = "/tmp/vllm.log"
     log = open(log_path, "w")
 
-    def server_log(n=40):
+    def server_log(n=250):
+        """vLLM reports 'see root cause above', so a short tail is useless --
+        the actual error sits well above the final traceback."""
         log.flush()
         try:
-            return "".join(open(log_path).readlines()[-n:])
+            lines = open(log_path).readlines()
         except OSError:
             return "(no log)"
+        return "".join(lines[-n:])
 
     server = subprocess.Popen(
         [
@@ -334,7 +344,7 @@ def local_brain(prompt: str = ""):
     for _ in range(180):
         if server.poll() is not None:
             print(f"FAILED: vLLM exited with code {server.returncode}\n")
-            print(server_log(50))
+            print(server_log())
             return
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{VLLM_PORT}/health", timeout=3)
@@ -343,7 +353,7 @@ def local_brain(prompt: str = ""):
             time.sleep(5)
     else:
         print("FAILED: vLLM never became healthy\n")
-        print(server_log(50))
+        print(server_log())
         server.terminate()
         return
     print(f"model ready in {time.time() - t0:.0f}s\n")

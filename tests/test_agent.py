@@ -183,3 +183,60 @@ class TestSelfBuilding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestMalformedToolArguments(unittest.TestCase):
+    """Smaller models emit raw newlines inside JSON strings, most often on
+    app_build because it carries a whole program as a string."""
+
+    def test_repair_escapes_control_chars_in_strings(self):
+        broken = '{"code": "import sys\nprint(1)\n", "name": "x"}'
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(broken)
+        parsed = json.loads(agent.repair_json(broken))
+        self.assertEqual(parsed["code"], "import sys\nprint(1)\n")
+        self.assertEqual(parsed["name"], "x")
+
+    def test_repair_leaves_valid_json_untouched(self):
+        good = '{"code": "print(1)\\n", "n": 3, "deep": {"a": [1, 2]}}'
+        self.assertEqual(json.loads(agent.repair_json(good)), json.loads(good))
+
+    def test_repair_preserves_existing_escapes(self):
+        raw = '{"s": "a \\"quoted\\" word\nand a newline"}'
+        self.assertEqual(json.loads(agent.repair_json(raw))["s"], 'a "quoted" word\nand a newline')
+
+    def test_control_chars_outside_strings_are_untouched(self):
+        raw = '{\n  "a": 1\n}'
+        self.assertEqual(json.loads(agent.repair_json(raw)), {"a": 1})
+
+    def test_parse_args_reports_whether_it_repaired(self):
+        args, repaired = agent.parse_args('{"a": 1}')
+        self.assertIsNone(repaired)
+        args, repaired = agent.parse_args('{"a": "x\ny"}')
+        self.assertEqual(args["a"], "x\ny")
+        self.assertIsNotNone(repaired)
+
+    def test_kernel_repairs_and_rewrites_the_message(self):
+        """The stored message must be valid, or the next request is rejected."""
+        code = "import sys\nprint('hi')\n"
+        bad = '{"name": "fixme", "description": "d", "spec": "s", "code": "%s"}' % code
+        k, ctx = make_kernel([
+            {"tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "app_build", "arguments": bad}}]},
+            {"content": "built it"},
+        ])
+        self.assertEqual(k.turn("build something"), "built it")
+
+        self.assertIsNotNone(ctx.registry.get("fixme"), "repaired call should have installed")
+        stored = [m for m in k.messages if m.get("tool_calls")][0]["tool_calls"][0]
+        json.loads(stored["function"]["arguments"])  # must not raise
+
+    def test_unsalvageable_arguments_are_neutralised(self):
+        k, _ = make_kernel([
+            {"tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "fs_read", "arguments": "{definitely not json"}}]},
+            {"content": "recovered"},
+        ])
+        self.assertEqual(k.turn("go"), "recovered")
+        stored = [m for m in k.messages if m.get("tool_calls")][0]["tool_calls"][0]
+        self.assertEqual(json.loads(stored["function"]["arguments"]), {})
