@@ -252,3 +252,60 @@ class TestExecutorDelegation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBuildTimeSmokeCheck(unittest.TestCase):
+    """app_build must catch programs that install cleanly and then do nothing."""
+
+    def setUp(self):
+        self.ctx = Ctx()
+
+    def build(self, name, code):
+        return syscalls.dispatch(
+            "app_build",
+            {"name": name, "description": "d", "spec": "s", "code": code},
+            self.ctx,
+        )
+
+    def test_uncalled_main_is_caught(self):
+        """The exact bug a 7B model shipped: main() defined, never called."""
+        out = self.build("smoke-dice", "import random\n\ndef main():\n    print(random.randint(1,6))\n")
+        self.assertIn("never calls it", out)
+        self.assertIn("printed nothing", out)
+        self.assertIn("FIX THE CODE", out)
+        self.assertNotIn("The user can now run it", out)
+
+    def test_working_app_reports_its_output(self):
+        out = self.build("smoke-good", "print('hello from the app')\n")
+        self.assertIn("smoke run ok: hello from the app", out)
+        self.assertIn("The user can now run it", out)
+        self.assertNotIn("PROBLEM", out)
+
+    def test_non_stdlib_import_is_caught(self):
+        out = self.build("smoke-deps", "import requests\nprint(requests)\n")
+        self.assertIn("not in the standard library", out)
+        self.assertIn("FIX THE CODE", out)
+
+    def test_syntax_error_is_caught(self):
+        out = self.build("smoke-broken", "def oops(:\n    pass\n")
+        self.assertIn("syntax error", out)
+        self.assertIn("FIX THE CODE", out)
+
+    def test_app_requiring_arguments_is_not_condemned(self):
+        """Exiting non-zero with no args can be legitimate; report, don't accuse."""
+        code = (
+            "import sys\n"
+            "if len(sys.argv) < 2:\n"
+            "    sys.exit('usage: needs an argument')\n"
+            "print(sys.argv[1])\n"
+        )
+        out = self.build("smoke-args", code)
+        self.assertIn("may be expected", out)
+        self.assertNotIn("FIX THE CODE", out)
+
+    def test_app_is_still_installed_when_suspect(self):
+        """Flagging a problem must not lose the code -- the model has to read it."""
+        self.build("smoke-keep", "def main():\n    print(1)\n")
+        app = self.ctx.registry.get("smoke-keep")
+        self.assertIsNotNone(app)
+        self.assertIn("def main", app.code)

@@ -15,6 +15,7 @@ Layout:
         data/           the app's own writable scratch space
 """
 
+import ast
 import json
 import os
 import re
@@ -40,6 +41,57 @@ CAPABILITIES = {
 
 class AppError(Exception):
     pass
+
+
+def validate(code: str) -> list[str]:
+    """Static checks on generated code, before anything is executed.
+
+    Catches the ways a model most often hands over a program that installs
+    cleanly and then does nothing: a syntax error, an import that is not in the
+    standard library (apps have no pip), or -- the classic -- a main() that is
+    defined and never called, which exits 0 in silence.
+    """
+    problems = []
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"syntax error on line {e.lineno}: {e.msg}"]
+
+    # stdlib-only is a hard contract: there is no pip at boot.
+    stdlib = sys.stdlib_module_names
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module] if node.module and node.level == 0 else []
+        else:
+            continue
+        for name in names:
+            root = (name or "").split(".")[0]
+            if root and root not in stdlib:
+                problems.append(
+                    f"imports {root!r}, which is not in the standard library -- "
+                    "apps must be stdlib-only, there is no pip"
+                )
+
+    # A main() nobody calls is the single most common silent no-op.
+    defines_main = any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "main"
+        for n in tree.body
+    )
+    if defines_main:
+        called = any(
+            isinstance(n, ast.Call) and getattr(n.func, "id", None) == "main"
+            for n in ast.walk(tree)
+        )
+        if not called:
+            problems.append(
+                "defines main() but never calls it, so running it prints nothing -- "
+                'add `if __name__ == "__main__": main()`'
+            )
+
+    return sorted(set(problems))
 
 
 @dataclass

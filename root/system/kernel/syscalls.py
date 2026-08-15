@@ -19,9 +19,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from . import paths
-from .apps import CAPABILITIES, AppError
+from .apps import CAPABILITIES, AppError, validate
 
 MAX_OUTPUT = 20000  # chars returned to the model from any one syscall
+SMOKE_TIMEOUT = 20  # seconds allowed for the post-build smoke run
 
 REGISTRY: dict = {}
 
@@ -452,10 +453,42 @@ def _app_build(args, ctx):
         secrets=args.get("secrets") or [],
         model=ctx.model,
     )
-    return (
+    lines = [
         f"installed app '{app.name}' at {paths.rel(app.path)} "
-        f"(caps: {', '.join(app.caps) or 'none'}). The user can now run it by name."
-    )
+        f"(caps: {', '.join(app.caps) or 'none'})."
+    ]
+
+    # An app that installs cleanly and then does nothing is the most common way
+    # a generated program fails, and a model will happily report success unless
+    # it is told otherwise. Check before handing it back.
+    suspect = False
+
+    for problem in validate(args["code"]):
+        lines.append(f"  PROBLEM: {problem}")
+        suspect = True
+
+    smoke = ctx.registry.run(app.name, [], secrets=ctx.secrets, timeout=SMOKE_TIMEOUT)
+    stdout = (smoke.get("stdout") or "").strip()
+    stderr = (smoke.get("stderr") or "").strip()
+
+    if smoke["code"] == 0 and not stdout:
+        lines.append(
+            "  PROBLEM: smoke run exited 0 but printed nothing. The app does not do "
+            "anything when run. Do not report this as working."
+        )
+        suspect = True
+    elif smoke["code"] != 0:
+        lines.append(f"  smoke run (no arguments) exited {smoke['code']}: {stderr[:300] or '(no stderr)'}")
+        lines.append("  If this app requires arguments, that may be expected; otherwise fix it.")
+    else:
+        lines.append(f"  smoke run ok: {stdout.splitlines()[0][:120]}")
+
+    if suspect:
+        lines.append("FIX THE CODE AND CALL app_build AGAIN. Do not tell the user it works.")
+    else:
+        lines.append("The user can now run it by name.")
+
+    return "\n".join(lines)
 
 
 @syscall(
