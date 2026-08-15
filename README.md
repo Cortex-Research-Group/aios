@@ -155,6 +155,16 @@ paperwork:
 `kernel/sandbox.py` imports `modal` lazily and only when selected, so the stick,
 the VPS and the VM keep their zero-dependency guarantee.
 
+This is verified, not asserted. `modal run build/modal/aios_modal.py::selftest`
+installs the *same* network-probing program twice, differing only in its manifest,
+and runs both through the sandbox:
+
+```
+app declaring   net : NETWORK_REACHABLE
+app declaring  none : NETWORK_BLOCKED URLError
+RESULT: capability enforcement is REAL
+```
+
 So: run adventurous prompts with `/sandbox modal`, not on your laptop. The local
 default is fine for code you'd have written yourself, and honest about being a
 disclosure mechanism rather than a jail.

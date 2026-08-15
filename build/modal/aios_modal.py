@@ -20,8 +20,6 @@ from pathlib import Path
 
 import modal
 
-PAYLOAD = Path(__file__).resolve().parents[2] / "root"
-
 app = modal.App("aios")
 
 # The OS root. Everything the agent creates persists here.
@@ -31,13 +29,20 @@ root_volume = modal.Volume.from_name("aios-root", create_if_missing=True)
 # misbehaving app cannot reach the vault.
 app_data = modal.Volume.from_name("aios-app-data", create_if_missing=True)
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    # modal is installed so the kernel can use the Sandbox executor from inside.
-    .pip_install("modal")
-    .add_local_dir(PAYLOAD / "system", remote_path="/opt/aios-system")
-    .add_local_file(PAYLOAD / "aios", remote_path="/opt/aios-launcher")
-)
+# modal is installed so the kernel can use the Sandbox executor from inside.
+image = modal.Image.debian_slim(python_version="3.12").pip_install("modal")
+
+# This module is re-imported inside the container, where __file__ lives at
+# /root/aios_modal.py and has no grandparent -- resolving the payload path
+# unconditionally crashes every container on import. The local tree only needs
+# to be located when the image is being defined, which only happens locally.
+if modal.is_local():
+    PAYLOAD = Path(__file__).resolve().parents[2] / "root"
+    image = (
+        image
+        .add_local_dir(PAYLOAD / "system", remote_path="/opt/aios-system")
+        .add_local_file(PAYLOAD / "aios", remote_path="/opt/aios-launcher")
+    )
 
 # Must expose OPENROUTER_API_KEY. Create with:
 #   modal secret create openrouter-api-key OPENROUTER_API_KEY=sk-or-...
@@ -99,7 +104,8 @@ def status():
     import os
 
     if not os.path.isdir(f"{AIOS_HOME}/apps"):
-        return "volume is empty -- run a session first"
+        print("volume is empty -- run a session first")
+        return
 
     lines = []
     apps_dir = f"{AIOS_HOME}/apps"
@@ -114,7 +120,7 @@ def status():
     notes = sorted(os.listdir(mem_dir)) if os.path.isdir(mem_dir) else []
     vault = "sealed" if os.path.exists(f"{AIOS_HOME}/vault/keys.enc") else "none (key from environment)"
 
-    return (
+    print(
         f"apps ({len(lines)}):\n" + ("\n".join(lines) or "  (none)") +
         f"\n\nmemory: {len(notes)} notes\nvault:  {vault}"
     )
@@ -166,7 +172,7 @@ def selftest():
     report.append("RESULT: capability enforcement is REAL" if ok else "RESULT: FAILED -- see output above")
 
     root_volume.commit()
-    return "\n".join(report)
+    print("\n".join(report))
 
 
 @app.local_entrypoint()

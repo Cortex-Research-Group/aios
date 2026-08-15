@@ -105,16 +105,17 @@ class ModalExecutor:
                 timeout=timeout + 60,
                 block_network=block_network,
                 volumes=volumes,
-                workdir="/work",
+                workdir="/tmp",
             )
-            sb.mkdir("/work", parents=True)
             if "AIOS_APP_DATA" in env:
-                sb.mkdir(env["AIOS_APP_DATA"], parents=True)
-            with sb.open("/work/main.py", "w") as f:
-                f.write(app.code)
+                sb.exec("mkdir", "-p", env["AIOS_APP_DATA"]).wait()
 
+            # The program is handed over as an argument rather than written to a
+            # file: Modal retired the Sandbox filesystem API, and `python -c`
+            # needs no filesystem at all. Trailing arguments land in sys.argv[1:]
+            # exactly where a generated app expects them.
             proc = sb.exec(
-                "python", "-u", "/work/main.py", *(args or []),
+                "python", "-u", "-c", app.code, *(args or []),
                 env=env or None,
                 timeout=timeout,
             )
