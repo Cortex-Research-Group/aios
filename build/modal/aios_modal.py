@@ -175,6 +175,79 @@ def selftest():
     print("\n".join(report))
 
 
+@app.function(
+    image=image,
+    volumes={AIOS_HOME: root_volume},
+    secrets=[openrouter],
+    timeout=900,
+)
+def smoke(prompt: str = ""):
+    """Drive one real agent turn against the live API, without a terminal.
+
+    This is the only way to exercise llm.py -- SSE streaming and fragmented
+    tool-call accumulation -- since the interactive shell needs a TTY.
+    """
+    import os
+    import sys
+
+    os.environ["AIOS_HOME"] = AIOS_HOME
+    _sync_system()
+    sys.path.insert(0, f"{AIOS_HOME}/system")
+
+    from kernel import agent, llm
+    from kernel import apps as kapps
+    from kernel import memory as kmem
+    from kernel import sandbox as ksandbox
+
+    prompt = prompt or (
+        "Build an app called 'clock' that prints the current UTC time in ISO format, "
+        "plus the day of the week. Then run it to prove it works."
+    )
+
+    client = llm.OpenRouter(os.environ["OPENROUTER_API_KEY"], llm.DEFAULT_MODEL)
+    print(f"model : {llm.DEFAULT_MODEL}")
+    try:
+        info = client.check()
+        print(f"key   : ok (limit={info.get('limit')}, used={info.get('usage')})")
+    except llm.LLMError as e:
+        print(f"key   : FAILED -- {e}")
+        return
+
+    def emit(kind, data):
+        if kind == "token":
+            print(data["text"], end="", flush=True)
+        elif kind == "syscall":
+            args = {k: (str(v)[:60] + "…" if len(str(v)) > 60 else v) for k, v in data["args"].items()}
+            print(f"\n  · {data['name']}({args})", flush=True)
+        elif kind == "result":
+            print(f"    -> {data['output'][:300]}", flush=True)
+        elif kind == "usage":
+            if data.get("cost"):
+                print(f"    [${data['cost']:.4f}]", flush=True)
+
+    ctx = agent.Context(
+        registry=kapps.Registry(executor=ksandbox.ModalExecutor(volume="aios-app-data")),
+        memory=kmem.Memory(),
+        secrets=dict(os.environ),
+        model=llm.DEFAULT_MODEL,
+        autonomy="full",  # nobody is here to approve anything
+        emit=emit,
+    )
+
+    print(f"\nprompt: {prompt}\n" + "-" * 70)
+    try:
+        final = agent.Kernel(client, ctx).turn(prompt)
+    except llm.LLMError as e:
+        # Raising here would cross the Modal boundary as an exception whose
+        # class the local side cannot import, hiding the actual message.
+        print(f"\n\nSMOKE FAILED: {e}")
+        return
+    print("\n" + "-" * 70)
+    print(f"FINAL REPLY:\n{final}")
+
+    root_volume.commit()
+
+
 @app.local_entrypoint()
 def main():
     shell.remote()

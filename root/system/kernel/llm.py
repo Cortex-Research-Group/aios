@@ -9,8 +9,14 @@ import urllib.error
 import urllib.request
 
 API = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "anthropic/claude-opus-4.5"
+DEFAULT_MODEL = "anthropic/claude-opus-5"
 TIMEOUT = 180
+
+# OpenRouter reserves max_tokens against your credit balance up front. Left
+# unset it reserves the model's entire context (65k+), which a credit-limited
+# key cannot afford -- the request fails with a 402 before a single token is
+# generated. Cap it at something that still fits a generated app comfortably.
+DEFAULT_MAX_TOKENS = 8192
 
 
 class LLMError(Exception):
@@ -47,9 +53,10 @@ def _request(url: str, key: str, payload: dict | None = None, stream: bool = Fal
 
 
 class OpenRouter:
-    def __init__(self, key: str, model: str = DEFAULT_MODEL):
+    def __init__(self, key: str, model: str = DEFAULT_MODEL, max_tokens: int = DEFAULT_MAX_TOKENS):
         self.key = key
         self.model = model
+        self.max_tokens = max_tokens
 
     # --- account -------------------------------------------------------------
 
@@ -76,6 +83,7 @@ class OpenRouter:
             "messages": messages,
             "stream": True,
             "usage": {"include": True},
+            "max_tokens": self.max_tokens,
         }
         if tools:
             payload["tools"] = tools
