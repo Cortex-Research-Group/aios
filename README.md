@@ -99,6 +99,7 @@ root/                     the entire OS — this tree is the deliverable
 │   │   ├── apps.py       userland registry — install, version, run
 │   │   ├── memory.py     markdown facts + TF-IDF search
 │   │   ├── sandbox.py    optional confined execution (Modal), lazily imported
+│   │   ├── world.py      JEPA-style predictor: what will this syscall do?
 │   │   ├── vault.py      ChaCha20 + scrypt secret storage
 │   │   ├── llm.py        OpenRouter client (streaming, tool calls)
 │   │   └── paths.py      the root, and the jail check
@@ -169,6 +170,60 @@ So: run adventurous prompts with `/sandbox modal`, not on your laptop. The local
 default is fine for code you'd have written yourself, and honest about being a
 disclosure mechanism rather than a jail.
 
+## The world model (the JEPA half)
+
+The kernel reasons in token space: write a syscall, run it, read the result. That
+is fine when a syscall is cheap and reversible, and exactly wrong when it is not —
+you cannot un-run `rm -rf /apps` and read the outcome.
+
+So `kernel/world.py` learns to answer *"what would that do?"* without doing it,
+following the Joint Embedding Predictive Architecture idea: encode the state,
+predict the **embedding** of the next state from the current embedding plus the
+action. It never reconstructs the literal next state — only the representation.
+
+    predict(encode(state), encode(action))  ≈  encode(next_state)
+
+Training data costs nothing: every syscall already journals a
+`(state, action, next_state)` triple. `/world train` fits on them.
+
+```
+proposed syscall                     magnitude   direction   destructive
+fs_list                              negligible  none        -
+proc_run(ls -la)                     ordinary    removes     -
+fs_write                             ordinary    creates     -
+app_build                            extreme     creates     -
+proc_run(rm data/f1.txt)             ordinary    removes     *** YES ***
+proc_run(rm -rf apps)                extreme     removes     *** YES ***
+```
+
+Magnitude and direction are reported separately on purpose: installing an app
+moves the world further than deleting one note, but only one of them destroys
+your work.
+
+### Bootstrapping
+
+Journalled usage only covers what you happened to do, and nobody spends a session
+deleting things — so a model trained purely on real usage has never seen
+destruction. Measured, such a model predicted `rm -rf /apps` would **increase**
+the app count. `/world bootstrap` fixes that: the OS practises in a throwaway
+root, destruction included, and records the same triples. Nothing touches the
+real root.
+
+### What it is and is not
+
+- The encoder is **fixed** (hand-designed features over the filesystem), not
+  learned. Real JEPA learns it jointly with an EMA target encoder and a
+  stop-gradient to avoid representation collapse. A fixed encoder cannot
+  collapse, which removes both the hardest part and the part that makes JEPA
+  interesting on raw perceptual data.
+- The predictor is **ridge regression on the residual**, closed-form, and uses
+  the action only. Including the state measured worse on every count: it gave
+  the predictor a drift term that fired regardless of action, so a read scored
+  as disturbing as a write. The state is still recorded in every transition, so
+  a nonlinear predictor can use it later without re-gathering data.
+- With few transitions it says so (`under-trained`) rather than emitting
+  confident nonsense.
+
 ## Syscalls
 
 | | |
@@ -180,12 +235,18 @@ disclosure mechanism rather than a jail.
 | `mem_write` `mem_search` | durable memory |
 | `app_build` `app_run` `app_list` `app_source` | the userland |
 
+Every syscall is journaled with a before/after state embedding, which is what the
+world model trains on.
+
 ## Tests
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-46 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
-filesystem jail, the permission gate, memory ranking, the app lifecycle, the
-kernel loop against a scripted model, and executor delegation.
+123 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
+filesystem jail, the permission gate, memory ranking, the app lifecycle,
+build-time smoke checks, the kernel loop against a scripted model, executor
+delegation, OpenRouter wire-format parsing, offline degradation, and the world
+model — including that it beats the do-nothing baseline, flags deletions as
+destructive, and predicts exactly zero for read-only syscalls.

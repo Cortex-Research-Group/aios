@@ -3,7 +3,7 @@
 stdlib urllib only -- no requests, no openai package. Defaults to OpenRouter
 (one key, ~300 models, swap brains at runtime with /model), but the same wire
 format is spoken by llama.cpp's server, vLLM, Ollama and friends, so pointing
-base_url at a locally hosted model needs no new code path -- see kernel/brain.py.
+base_url at a locally hosted model needs no new code path.
 """
 
 import json

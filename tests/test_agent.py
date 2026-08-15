@@ -177,8 +177,40 @@ class TestSelfBuilding(unittest.TestCase):
         k, _ = make_kernel([{"tool_calls": [call("fs_list", path="/")]}, {"content": "ok"}])
         k.turn("list things")
         lines = [json.loads(l) for l in k.log_path.read_text().splitlines()]
-        roles = [e.get("role") for e in lines][-4:]
-        self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+        roles = [e.get("role") for e in lines][-5:]
+        # A transition is journaled around every syscall: it is the world
+        # model's training data.
+        self.assertEqual(roles, ["user", "assistant", "transition", "tool", "assistant"])
+
+    def test_transitions_are_journaled_for_the_world_model(self):
+        from kernel import world
+
+        k, _ = make_kernel([{"tool_calls": [call("fs_write", path="data/w.txt", content="x")]},
+                            {"content": "done"}])
+        k.turn("write a file")
+
+        entries = [json.loads(l) for l in k.log_path.read_text().splitlines()]
+        transitions = [e for e in entries if e.get("role") == "transition"]
+        self.assertTrue(transitions, "no transition journaled")
+
+        t = transitions[-1]
+        self.assertEqual(t["action"], "fs_write")
+        self.assertEqual(len(t["s"]), world.D_STATE)
+        self.assertEqual(len(t["a"]), world.D_ACTION)
+        self.assertEqual(len(t["s2"]), world.D_STATE)
+        self.assertNotEqual(t["s"], t["s2"], "writing a file should move the state embedding")
+
+    def test_transitions_are_loadable_as_training_data(self):
+        from kernel import world
+
+        k, _ = make_kernel([{"tool_calls": [call("fs_write", path="data/z.txt", content="y")]},
+                            {"content": "done"}])
+        k.turn("write another")
+        samples = world.load_transitions(k.log_path.parent)
+        self.assertTrue(samples)
+        state, action, nxt = samples[-1]
+        self.assertEqual((len(state), len(action), len(nxt)),
+                         (world.D_STATE, world.D_ACTION, world.D_STATE))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import os
 import time
 from pathlib import Path
 
-from . import paths, syscalls
+from . import paths, syscalls, world
 
 MAX_STEPS = 25  # a runaway tool loop should stall, not bill you forever
 
@@ -98,7 +98,8 @@ answers the question, say the answer -- do not narrate the syscall.
 class Context:
     """Everything a syscall needs, plus the permission gate."""
 
-    def __init__(self, registry, memory, secrets, model, autonomy="ask", confirm=None, emit=None):
+    def __init__(self, registry, memory, secrets, model, autonomy="ask", confirm=None,
+                 emit=None, world_model=None, record=True):
         self.registry = registry
         self.memory = memory
         self.secrets = secrets
@@ -106,6 +107,29 @@ class Context:
         self.autonomy = autonomy  # 'ask' | 'full' | 'readonly'
         self._confirm = confirm
         self._emit = emit
+        # The world model predicts what a syscall would do. Recording the
+        # before/after embeddings is what gives it something to learn from.
+        self.world_model = world_model
+        self.record = record
+
+    def observe(self):
+        """Embed the current OS state, or None if recording is off."""
+        if not self.record:
+            return None
+        try:
+            return world.encode_state()
+        except OSError:
+            return None  # a world model is never worth failing a syscall over
+
+    def foresee(self, name: str, args: dict) -> dict | None:
+        """What does the world model think this syscall will do?"""
+        wm = self.world_model
+        if wm is None or not wm.is_trained:
+            return None
+        state = self.observe()
+        if state is None:
+            return None
+        return wm.explain(state, world.encode_action(name, args))
 
     def emit(self, kind: str, **data) -> None:
         if self._emit:
@@ -205,7 +229,19 @@ class Kernel:
                     call["function"]["arguments"] = "{}"
                 else:
                     self.ctx.emit("syscall", name=name, args=args)
+                    before = self.ctx.observe()
                     out = syscalls.dispatch(name, args, self.ctx)
+                    after = self.ctx.observe()
+                    if before is not None and after is not None:
+                        # Training data for the world model, gathered simply by
+                        # using the OS.
+                        self._log({
+                            "role": "transition",
+                            "action": name,
+                            "s": before,
+                            "a": world.encode_action(name, args),
+                            "s2": after,
+                        })
 
                 if name == "app_build" and out.startswith("installed"):
                     built = True

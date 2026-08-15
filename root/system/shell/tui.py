@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from kernel import agent, apps, llm, memory, paths, sandbox, syscalls, vault
+from kernel import agent, apps, llm, memory, paths, sandbox, syscalls, vault, world
 
 try:
     import readline  # noqa: F401  -- line editing and history, if available
@@ -66,6 +66,7 @@ class Shell:
         self.config = self._load_config()
         self.registry = apps.Registry(executor=self._build_executor())
         self.memory = memory.Memory()
+        self.world = world.WorldModel.load()
         self.secrets: dict = {}
         self.kernel = None
         self.hosted = False
@@ -136,6 +137,7 @@ class Shell:
             autonomy=self.config["autonomy"],
             confirm=self._confirm,
             emit=self._on_event,
+            world_model=self.world,
         )
         self.ctx = ctx
         self.kernel = agent.Kernel(self.client, ctx)
@@ -145,6 +147,9 @@ class Shell:
         print(dim(f"  brain  {model}" + ("   key from environment" if self.hosted else "")))
         confine = self.registry.executor.name if self.registry.executor else "subprocess"
         print(dim(f"  apps   {n_apps}    memory {n_mem} notes    autonomy {self.config['autonomy']}    apps run in: {confine}"))
+        if self.world.is_trained:
+            note = "" if self.world.is_reliable else "  (under-trained)"
+            print(dim(f"  world  predictor trained on {self.world.trained_on} transitions{note}"))
         print(dim("  type /help for commands, or just say what you want\n"))
         return True
 
@@ -227,6 +232,16 @@ class Shell:
             return True
         self._break_stream()
         print(yellow(f"\n  {name} wants to run:"))
+        foresight = self.ctx.foresee(name, args)
+        if foresight:
+            caveat = "" if foresight["reliable"] else " (under-trained -- a hint, not a verdict)"
+            if foresight["destructive"]:
+                print(red(f"    ⚠ predicted to REMOVE things ({foresight['magnitude']} impact){caveat}"))
+            else:
+                print(dim(f"    predicted impact: {foresight['magnitude']}, {foresight['direction']}{caveat}"))
+            changes = ", ".join(f"{k} {v:+.3f}" for k, v in foresight["predicted_changes"].items())
+            if changes:
+                print(dim(f"    predicted change: {changes}"))
         for k, v in args.items():
             text = str(v)
             if len(text) > 400:
@@ -319,6 +334,7 @@ class Shell:
   {bold('/models [filter]')}  browse available models
   {bold('/autonomy [mode]')}  ask | full | readonly
   {bold('/sandbox [mode]')}    off | modal -- where generated apps run
+  {bold('/world [train]')}     predict what a syscall will do before running it
   {bold('/syscalls')}         list kernel syscalls
   {bold('/reset')}            clear the conversation, keep apps and memory
   {bold('/exit')}             halt
@@ -399,6 +415,37 @@ class Shell:
             else:
                 where = self.registry.executor.name if self.registry.executor else "subprocess"
                 print(f"  {where} " + dim("(off | modal)\n"))
+
+        elif cmd == "world":
+            if arg == "train":
+                samples = world.load_transitions()
+                if not samples:
+                    print(dim("  no transitions journaled yet -- use the OS a while first\n"))
+                    return None
+                stats = self.world.fit(samples)
+                self.world.save()
+                self.ctx.world_model = self.world
+                verdict = ("learned something" if stats["vs_static"] < 0.9
+                           else "no better than assuming nothing ever changes")
+                print(green(f"  trained on {stats['samples']} transitions"))
+                print(dim(f"  rmse {stats['rmse']:.4f}   vs do-nothing baseline {stats['vs_static']:.3f} -- {verdict}"))
+                if not self.world.is_reliable:
+                    print(yellow(f"  under {world.MIN_SAMPLES} samples: treat predictions as a hint\n"))
+                else:
+                    print()
+            elif arg == "forget":
+                self.world = world.WorldModel()
+                self.world.save()
+                self.ctx.world_model = self.world
+                print(dim("  world model discarded\n"))
+            else:
+                pending = len(world.load_transitions())
+                if self.world.is_trained:
+                    print(f"  trained on {bold(str(self.world.trained_on))} transitions "
+                          + dim(f"({'reliable' if self.world.is_reliable else 'under-trained'})"))
+                else:
+                    print(dim("  no world model yet"))
+                print(dim(f"  {pending} transitions journaled    /world train | /world forget\n"))
 
         elif cmd == "syscalls":
             for s in syscalls.REGISTRY.values():
