@@ -44,7 +44,8 @@ The `root/` tree *is* the OS. Copy it anywhere; it never writes outside itself.
 | **Modal** | `modal run build/modal/aios_modal.py` | Persistent state on a Volume, and **real confinement** for generated apps. |
 | **VPS** | `./build/deploy.sh root@your-host` | Always-on. Your OS lives at an IP, keeps running when the laptop sleeps, and is where [scheduled jobs](#scheduling) earn their keep. |
 | **Local VM** | `./build/vm/run-vm.sh -d` then `./build/deploy.sh` | Disposable Alpine boot. *Untested — needs a qemu that builds on your host.* |
-| **USB stick** | copy `root/` to the drive, run `./aios` | Portable. Bare-metal boot is the next milestone. |
+| **USB stick (running host)** | copy `root/` to the drive, run `./aios` | Portable, but still runs under the host's OS. |
+| **USB stick (bare metal)** | `./build/usb/make-usb.sh --device /dev/diskN` | Boots its own machine. See [Bootable USB](#bootable-usb). *Image build is verified; booting real firmware from it is not — see the honesty note below.* |
 
 ### Modal
 
@@ -88,6 +89,40 @@ ssh root@203.0.113.9 -t aios
 Re-run `deploy.sh` any time to push code changes — apps, memory and the vault on
 the target are left alone. On the physical console the machine boots *into* aiOS;
 SSH gives you a normal shell, so a wedged agent never locks you out of your own box.
+
+### Bootable USB
+
+```sh
+./build/usb/make-usb.sh --image-only aios-usb.img   # build + verify, write nothing
+./build/usb/make-usb.sh --device /dev/diskN          # build + write to a real stick (macOS)
+./build/usb/make-usb.sh --device /dev/sdX            # build + write to a real stick (Linux)
+```
+
+The image is an unmodified, checksum-verified official Alpine Standard ISO —
+already a hybrid BIOS+UEFI image, which is exactly what Alpine's own docs
+describe as safe to `dd` — immediately followed by a FAT32 partition carrying
+the aiOS payload. One new MBR partition-table entry, written into a slot the
+ISO leaves at all zero (`build/usb/mkusb-mbr.py`), is what makes the second
+partition visible at all; nothing else in the ISO is touched, and the script
+proves that by assertion before it writes anything.
+
+First boot needs one manual step, once — login as `root` (Alpine's live-media
+default, no password) and run the `provision-usb.sh` script sitting at the top
+of the `AIOSDATA` partition. That installs python3, sets aiOS as the console
+session, and commits the config with Alpine's `lbu`, so every boot after that
+needs no login and no network at all.
+
+**Be honest about what "bootable" means here.** This session verified the
+parts that can be verified without booting anything: the ISO's checksum, that
+the assembled image mounts and its data partition matches the source tree
+byte-for-byte, that the MBR patch changes only the 10 bytes it's supposed to
+and nothing else, and the full `--device` write path (including the
+confirmation prompt) against a real virtual disk. It did **not** verify that
+a real machine's firmware actually boots from the result — that needs either
+qemu (fails to build on this class of Mac; see `HANDOFF.md`) or a real stick
+in a real machine, and this session had neither. Try it and it works: great,
+that closes the gap. Try it and it doesn't: the MBR-patch reasoning in
+`HANDOFF.md` is the place to start debugging, not the safety gates.
 
 ## Architecture
 

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 build/vm/.cache/
+build/usb/.cache/
 
 # runtime state — the OS's own, never committed
 root/vault/

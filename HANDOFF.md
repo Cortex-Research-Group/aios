@@ -38,6 +38,7 @@ modal run build/modal/aios_modal.py::status     # what the volume holds
 modal run build/modal/aios_modal.py::selftest   # prove sandbox capability enforcement
 modal run build/modal/aios_modal.py::smoke      # one real agent turn, no TTY needed
 modal run build/modal/aios_modal.py::local_brain  # GPU, self-hosted Qwen2.5-7B
+./build/usb/make-usb.sh --image-only aios-usb.img  # build + verify a boot image, write nothing
 python3 -m unittest discover -s tests           # 174 tests
 ```
 
@@ -55,9 +56,23 @@ live-API claim in this repo was verified.
   `aios-hf-cache` (model weights).
 - The OpenRouter key has a **$1 limit** — this is why `max_tokens` is capped (see below).
 - Host is a 2017 Intel MacBook, 2 cores / 8 GB, macOS 13. **qemu cannot be built
-  here** (Homebrew deprioritises Intel+Ventura; the source build fails). The local
-  VM target is written but *untested* — do not claim otherwise.
+  here** — confirmed again this session with a concrete cause, not just repeated
+  folklore: `p11-kit`'s `meson test` hangs on `test-transport`/`test-transport3`
+  (60s timeout each, `SIGTERM`-killed) during `brew install qemu`, almost
+  certainly because this sandboxed shell has no D-Bus session bus. Homebrew
+  treats a test failure as fatal on this unsupported tier (macOS 13 + Intel) and
+  will not skip it. The local VM target is written but *untested* — do not claim
+  otherwise.
+- **Docker is not installed.** `colima`/`lima` (Go binaries, bottle-installed, no
+  compile trap) work fine and give a real Linux VM via macOS's Virtualization
+  framework — but that framework's Linux boot path loads a kernel+initrd
+  directly and skips BIOS/MBR emulation entirely, so it cannot test the one
+  thing that actually needed testing this session (does firmware find and boot
+  from a patched MBR). `vfkit` has the same limitation. Only qemu's full-system
+  emulation does that, and it isn't available here.
 - The Mac is pre-T2, so a bootable USB would not hit Secure Boot problems.
+- `mtools`, `dosfstools` are now installed (`brew`, bottled) — used by
+  `build/usb/make-usb.sh` to build a FAT32 image without mounting or sudo.
 
 ---
 
@@ -77,6 +92,10 @@ root/system/kernel/
   agent.py      the loop; also JSON repair and transition journaling
 root/system/shell/tui.py    terminal shell, permission prompts, slash commands
 build/          provision.sh (VPS/VM), deploy.sh (over SSH), modal/, vm/
+build/usb/
+  make-usb.sh     builds + (optionally) writes a bootable aiOS USB image
+  mkusb-mbr.py    the one precise binary edit that makes it work -- see below
+  provision-usb.sh  first-boot script, ships on the image's data partition
 ```
 
 ---
@@ -102,12 +121,48 @@ build/          provision.sh (VPS/VM), deploy.sh (over SSH), modal/, vm/
   both times, app data accumulated across runs, everything confined to the root.
   `stop()` reaped the pidfile. Then backdated the job three days and restarted —
   **one** run on resume, not the 8,640 it slept through.
+- **The bootable-USB image, everything short of actually booting it:**
+  - The Alpine Standard ISO's sha256 verified against Alpine's own published
+    manifest (fetched fresh, not pinned — see lessons below).
+  - The MBR patch (`mkusb-mbr.py`) changes exactly 10 bytes, all inside the one
+    16-byte slot it targets, on the real downloaded ISO — checked with `cmp -l`,
+    not assumed. Every other byte of the 283MB ISO is untouched.
+  - The composite image (ISO + patched MBR + FAT32 data partition) attaches
+    cleanly with `hdiutil` as a two-partition disk; the data partition mounts
+    and its contents match `git archive HEAD root` byte-for-byte. Checked twice
+    — once from `--image-only`, once by re-attaching the image `make-usb.sh`
+    itself wrote in the device-write test below.
+  - **The full `--device` write path, run for real** against an `hdiutil`-attached
+    virtual disk (a plain file, zero physical risk — a disk image genuinely
+    reports `Device Location: External` / `Removable Media: Removable` to
+    `diskutil`, which is what makes this safe to test at all): confirmed the
+    confirmation-mismatch path refuses and writes nothing, then confirmed the
+    real path writes correctly, ejects, and the result re-verifies clean on a
+    fresh attach.
+  - This surfaced two real bugs before either shipped — see lessons below.
 
 **Written but NOT verified:**
 - **Local VM** (`build/vm/run-vm.sh`) — blocked on qemu. Syntax-checked only.
 - **VPS deploy** (`build/deploy.sh`) — no box to try it on. The provisioner logic
   was tested locally against a temp prefix.
-- **USB bare-metal boot** — never attempted.
+- **USB bare-metal boot — the one thing all of the above cannot prove.** Does a
+  real machine's firmware actually find and boot from the patched MBR? Needs
+  qemu (unavailable, confirmed above with a concrete cause) or a real stick in
+  a real machine (out of scope without someone physically present). Everything
+  upstream of "does it boot" is now verified; that one step is not, and no
+  amount of image-inspection substitutes for it. If you try it: report back
+  either way, and if it fails, `mkusb-mbr.py`'s slot-3 assumption is the first
+  thing to question, not the safety gates in `make-usb.sh`.
+- **`provision-usb.sh`'s Alpine mechanics, specifically.** The commands
+  (`blkid -L`, `lbu commit` with `LBU_BACKUPDIR`, the `/etc/local.d` hook,
+  `setup-apkcache`'s actual effect) are grounded in the real `alpine-conf`
+  package source, not memory or blog posts — extracted and read directly this
+  session (see lessons below). What is NOT verified is the boot-time apkovl
+  auto-restore this whole persistence story depends on: every source describes
+  it consistently ("scans all available filesystems for `*.apkovl.tar.gz`"),
+  but that logic lives in the initramfs/mkinitfs boot scripts, which were not
+  pulled and read the way `lbu` itself was. Second-most-likely failure point
+  after the MBR slot, if a real boot doesn't come back clean on reboot.
 - **Scheduling anywhere but this Mac.** The daemon has not run on Modal or a VPS.
   Modal in particular is serverless — a container stops when you leave, so a
   long-lived `schedd` there is not obviously meaningful. Untried, not designed for.
@@ -210,6 +265,71 @@ means destruction and flags `ls`.
 - Don't auto-start the daemon at boot. A job firing because someone opened a shell
   is exactly the surprise this OS should not spring.
 
+### Bootable USB
+- **When you can't test the real thing, find the largest piece of it you
+  actually can, and test that for real instead of reasoning about all of it.**
+  Booting real firmware was never testable this session. Everything upstream
+  of that — download integrity, the exact bytes a binary patch changes, whether
+  an assembled image mounts and matches its source, whether the destructive
+  device-write path's safety gates actually gate — all was. Doing that work
+  found two real bugs that pure code review had already missed once:
+  1. `IS_INTERNAL="$(... awk '/Internal/{print $2}')"` matched the *value*
+     "Internal" under macOS's `Device Location:` field, not a field literally
+     named `Internal:` (which doesn't exist). `$2` was therefore always
+     "Internal" or "External", never "Yes"/"No" — so
+     `[ "$IS_INTERNAL" = "No" ]` was **never true, for any device**, and the
+     script would have refused to write to a legitimate USB stick every single
+     time. Caught by running the real refusal logic against real `diskutil
+     info` output for an actual disk, not by reading the code again.
+  2. The FAT32 data-partition features (`apps`/`memory`/`vault`/`data` word
+     matching in `world.py`'s `proc_run` encoding — see the world-model
+     section above) is the same *shape* of bug as #1: code that looks locally
+     correct and is wrong about what a field or pattern actually contains.
+     Different subsystem, same lesson, same session. Worth remembering as a
+     class, not a one-off.
+  A destructive-write tool is exactly the wrong place to discover a safety
+  gate doesn't gate. It was caught here because a virtual disk backed by a
+  plain file reports `Device Location: External` / `Removable Media:
+  Removable` to `diskutil` just like real removable media does — meaning the
+  *entire* `--device` code path, including the interactive confirmation
+  prompt, is safely testable without any physical device at all. Do this
+  before ever pointing a similar tool at something real.
+- **Don't guess a CLI's flags from blog posts when the source is one `apk
+  fetch` away.** `lbu commit -d <dir>` looked, from multiple independent
+  write-ups, like "write the apkovl to this directory." It means "delete old
+  apk overlay files" — an entirely different flag. Downloaded the real
+  `alpine-conf` package (`curl .../alpine-conf-*.apk`, which is just a
+  tar.gz) and read `usr/sbin/lbu_commit` directly: the actual mechanism is
+  `LBU_BACKUPDIR` in `/etc/lbu/lbu.conf`, read at the top of every `lbu`
+  invocation, which bypasses Alpine's `/media/<usb|floppy>` convention
+  entirely. Would have shipped a config line that silently did the wrong
+  thing, discovered only when someone's "persistent" stick lost its state on
+  reboot.
+- **`/root/.profile` is not what you think it is for `lbu`.** By default `lbu
+  commit` only backs up `/etc/` (plus a `setup-alpine`-created user's home,
+  which this flow never runs). `provision.sh` (the VPS/VM target) edits
+  `/root/.profile` for console autostart and that's fine there — the VPS disk
+  is always-on, nothing needs to survive a wipe-and-restore cycle. On a
+  diskless Alpine stick it would silently not persist. `provision-usb.sh`
+  edits `/etc/profile` instead — functionally identical for a root-only
+  console appliance, and actually covered by `lbu`'s default scope.
+- **A foreign disk image's MBR is not something to hand to a real partitioning
+  tool.** `parted`/`sfdisk`/`diskutil` risk reinterpreting or rewriting the
+  two entries Alpine's own bootloader depends on. Inspecting the real,
+  downloaded ISO showed only 2 of 4 MBR slots used and the other two
+  provably all-zero (`xxd -s 446 -l 66`), and the ISO's size landed on an
+  exact 1 MiB boundary (270 MiB, not a round number by luck alone — Alpine
+  builds it that way). That made "write one precise, asserted, previously-
+  unused 16-byte entry" both correct and mechanically checkable — verify
+  `bytes(mbr[:slot]) == iso[:slot]` and same for after the slot — a smaller
+  claim than "used a real tool correctly," which would need trusting the tool
+  understood a hybrid MBR it didn't create.
+- **Fetch the release manifest, don't pin a version.** `run-vm.sh` hardcodes
+  `ALPINE_VER="3.22.4"`; by the time this session ran, Alpine had shipped
+  3.22.5. `make-usb.sh` fetches `latest-releases.yaml` fresh every run and
+  takes both the filename and the sha256 from it, so there is nothing to go
+  stale.
+
 ### Modal
 - **Never resolve local paths at module scope.** Modal re-imports the module inside
   the container where `__file__` is `/root/aios_modal.py`; `parents[2]` raised
@@ -273,15 +393,26 @@ means destruction and flags `ls`.
 - World model reports `under-trained` below 40 transitions rather than bluffing.
 - Qwen2.5-7B local brain works but is meaningfully worse than opus-5 at writing
   correct programs; it needed the build-time smoke check to self-correct.
+- **The USB image's persistence has never survived a real reboot.** Everything
+  in `provision-usb.sh` is grounded in the actual `alpine-conf` source (not
+  guessed), but the boot-time apkovl auto-restore it depends on was not itself
+  read or tested — see "Written but NOT verified" above. First real boot should
+  specifically check: does the stick come back with no login prompt on the
+  *second* boot, and is `/etc/profile`'s aios hook present after the reboot.
 
 ---
 
 ## Sensible next steps
 
-1. **VPS deploy** — still the only untested path that is cheap to verify, and now
-   more valuable: it is the always-on box that makes scheduling worth having.
-   Nothing about scheduling has been tried on a remote host.
-2. **Bare-metal USB** — the original goal; the Mac being pre-T2 helps.
+1. **Boot the USB image on real hardware, or find a working qemu.** This is now
+   the single highest-value next step: `build/usb/make-usb.sh` is written,
+   safety-tested, and structurally verified end to end, but nobody has watched
+   it actually boot. The Mac being pre-T2 helps if it's the test machine.
+   Failing that, a Linux box with a working qemu install would let this be
+   verified without any physical stick at all.
+2. **VPS deploy** — still the only untested deploy path that is cheap to verify,
+   and now more valuable: it is the always-on box that makes scheduling worth
+   having. Nothing about scheduling has been tried on a remote host.
 3. **Nonlinear world-model predictor** — the transitions already record state,
    so an MLP could exploit it. Only `WorldModel.fit()` changes.
 4. **Learned encoder** — would make the JEPA half faithful to the paper (needs an
