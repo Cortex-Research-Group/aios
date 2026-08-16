@@ -303,7 +303,7 @@ world model trains on.
 python3 -m unittest discover -s tests -v
 ```
 
-172 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
+174 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
 filesystem jail, the permission gate, memory ranking, the app lifecycle,
 build-time smoke checks, the kernel loop against a scripted model, executor
 delegation, OpenRouter wire-format parsing, offline degradation, scheduling
@@ -311,5 +311,6 @@ delegation, OpenRouter wire-format parsing, offline degradation, scheduling
 what the app declared, and that a missed schedule is not replayed), and the world
 model — including that it beats the do-nothing baseline, flags deletions as
 destructive regardless of size, predicts exactly zero for read-only syscalls
-(including ones it never saw verbatim in training), and does not mistake an
-ordinary flag like `--version` for `-rf`.
+(including ones it never saw verbatim in training), does not mistake an
+ordinary flag like `--version` for `-rf`, and does not flag a command for
+merely mentioning `apps` or `memory` in a path when it isn't deleting anything.

@@ -62,7 +62,7 @@ _SYSCALL_SLOTS = 20
 # the argument features live while D_ACTION stays 32, so dimensions alone cannot
 # tell a stale saved model from a current one -- it would load and be silently
 # misinterpreted. Bump this whenever the meaning of a slot moves.
-LAYOUT = 5
+LAYOUT = 6
 
 _PROC_BASE = _SYSCALL_SLOTS       # 20..27: what a shell command intends
 _CONTENT = _PROC_BASE + 8         # 28: size of the payload being written
@@ -188,10 +188,16 @@ def encode_action(name: str, args: dict | None = None) -> list[float]:
         # that do not delete anything. Only in the context of rm does "recursive,
         # force" mean "no confirmation, no going back".
         v[b + 1] = 1.0 if is_rm and any(_is_force_recursive_flag(w) for w in words) else 0.0
-        v[b + 2] = 1.0 if "apps" in words else 0.0
-        v[b + 3] = 1.0 if "memory" in words else 0.0
-        v[b + 4] = 1.0 if "vault" in words else 0.0
-        v[b + 5] = 1.0 if "data" in words else 0.0
+        # Same reasoning as the flag above, and found the same way: these four
+        # used to fire on the word alone, so `curl .../apps/list`, `mkdir
+        # apps/x` and `cat memory/note.md` all mentioned a directory name and
+        # picked up part of rm's learned effect on that directory, despite not
+        # deleting anything. Which directory is only informative in the context
+        # of an actual deletion; gate on is_rm like the flag feature.
+        v[b + 2] = 1.0 if is_rm and "apps" in words else 0.0
+        v[b + 3] = 1.0 if is_rm and "memory" in words else 0.0
+        v[b + 4] = 1.0 if is_rm and "vault" in words else 0.0
+        v[b + 5] = 1.0 if is_rm and "data" in words else 0.0
         v[b + 6] = 1.0 if any(w in ("mkdir", "touch", "cp", "mv", "tee") for w in words) else 0.0
         # b+7 was command length. Removed: it correlated with the destructive
         # indicators by accident of the training set (deletions happened to be

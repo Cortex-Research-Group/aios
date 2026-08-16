@@ -3,7 +3,7 @@
 Written so a fresh session can resume with no prior context. Read this, then
 `README.md` for the user-facing description.
 
-**State:** working, 172 tests green, everything committed.
+**State:** working, 174 tests green, everything committed.
 Nothing in flight, nothing half-finished.
 
 ---
@@ -38,7 +38,7 @@ modal run build/modal/aios_modal.py::status     # what the volume holds
 modal run build/modal/aios_modal.py::selftest   # prove sandbox capability enforcement
 modal run build/modal/aios_modal.py::smoke      # one real agent turn, no TTY needed
 modal run build/modal/aios_modal.py::local_brain  # GPU, self-hosted Qwen2.5-7B
-python3 -m unittest discover -s tests           # 172 tests
+python3 -m unittest discover -s tests           # 174 tests
 ```
 
 **The interactive shell needs a TTY, which an agent session cannot drive.** Use
@@ -93,7 +93,8 @@ build/          provision.sh (VPS/VM), deploy.sh (over SSH), modal/, vm/
 - Local GPU brain: Qwen2.5-7B via vLLM built and self-corrected a `dice` app in 20.6s.
 - World model: beats do-nothing baseline; flags deletions destructive regardless
   of size; read-only syscalls predict exactly 0.0000, including ones never seen
-  verbatim in training. Swept 33 representative commands (23 benign, 10
+  verbatim in training and ones that merely mention `apps`/`memory` in a path
+  without deleting anything. Swept 33 representative commands (23 benign, 10
   destructive) against a freshly bootstrapped model: 0 misclassifications.
 - Modal volume persistence across separate invocations.
 - **Scheduling, end to end on a real clock.** Built a `ticker` app, scheduled it
@@ -142,9 +143,9 @@ include *harmless* `proc_run` commands, or the model learns `proc_run` itself
 means destruction and flags `ls`.
 
 5. **A feature that *can* be true for a benign command will eventually be true
-   for one.** The `proc_run` action encoding had two features doing substring or
-   pattern matching without enough context, and both let something harmless
-   through as destructive:
+   for one.** The `proc_run` action encoding had four features doing substring
+   or word matching without enough context, and every one of them let something
+   harmless through as destructive:
    - `command length`, scaled 0–4 — correlated with the destructive indicators
      purely by accident of the training set (deletions in `bootstrap()` happened
      to be longer than `ls -la`). Ridge regression leaned on it as a danger
@@ -154,14 +155,28 @@ means destruction and flags `ls`.
    - `w.startswith("-") and ("r" in w or "f" in w)`, meant to catch `-rf` — also
      matched `--version`, `--force-color`, `--verbose`, anything with r or f
      anywhere in a long flag name. `python3 --version` predicted destructive.
-     Fix: `_is_force_recursive_flag()` matches only `-r`/`-f`/`-rf`/`-fr` or
-     `--recursive`/`--force` exactly, **and** only counts when an actual
-     `rm`-family word is also present in the command — so `grep -r` or
-     `tar -xvf` don't trigger it on their own.
-   Both were **already wrong at the commit that introduced the world model**,
-   not something scheduling broke — removing the length feature just stopped it
-   from masking the flag bug on some inputs. A 33-command sweep (23 benign, 10
-   destructive) now returns 0 misclassifications; see `TestBootstrapAndDestruction`.
+   - `"apps"`/`"memory"`/`"vault"`/`"data"` in `words` — meant to say *which*
+     directory a deletion targets, but fired on the word alone. `words` comes
+     from `cmd.replace("/", " ").split()`, so any path mentioning the directory
+     turns it into a standalone word: `mkdir apps/newapp`, `cat memory/note.md`,
+     `curl .../apps/list` all predicted destructive despite not deleting
+     anything. Found by deliberately auditing the sibling features after fixing
+     the `-rf` one, on the hypothesis that the same mistake was probably made
+     more than once — it was.
+   Fix for all three word/flag features, the same shape each time: gate on an
+   actual `rm`-family word (`rm`, `rmdir`, `unlink`, `shred`, `truncate`, `dd`)
+   being present in the *same* command. `_is_force_recursive_flag()` also
+   tightened to match only `-r`/`-f`/`-rf`/`-fr`/`--recursive`/`--force`
+   exactly, not any flag containing those letters. The directory word alone, or
+   the flag alone, is not informative — only in the context of an actual
+   deletion does either one mean anything.
+   All four were **already wrong at the commit that introduced the world
+   model**, not something scheduling broke — removing the length feature just
+   stopped it from masking the others on some inputs. A 33-command sweep
+   (23 benign, 10 destructive) now returns 0 misclassifications; see
+   `TestBootstrapAndDestruction`. **If another word/substring feature like this
+   gets added to `encode_action`, assume it has the same bug until swept against
+   a comparably wide command sample — three of four were broken, not one.**
 
 6. **The destructive gate should be direction alone, not direction gated by
    typical size.** `explain()` required `d >= self.scale`, where `scale` is the
@@ -244,12 +259,15 @@ means destruction and flags `ls`.
 - **`proc_run: ls` was wrongly flagged destructive — fixed this session.** An
   earlier version of this file claimed it predicted −0.007 and was "not
   escalated"; that was wrong, and was wrong at `a1cc896` too. Root causes were
-  the command-length feature and an overbroad `-rf` flag matcher, both described
-  under "World model" lesson 5 above, plus the destructive gate itself
-  (lesson 6). All three are fixed and covered by regression tests
-  (`test_unseen_benign_commands_are_not_flagged_destructive`,
+  four unguarded word/substring features and the destructive gate itself, all
+  described under "World model" lessons 5–6 above. Every `proc_run` action
+  feature that did word or substring matching was audited, not just the one
+  that produced the `ls` symptom — three of four were broken. All fixed and
+  covered by regression tests (`test_unseen_benign_commands_are_not_flagged_destructive`,
   `test_single_file_deletion_is_flagged_destructive`,
-  `test_destructive_does_not_depend_on_scale`). `world.LAYOUT` is now `5` —
+  `test_mentioning_a_directory_without_deleting_is_not_destructive`,
+  `test_deleting_named_directories_is_still_flagged`,
+  `test_destructive_does_not_depend_on_scale`). `world.LAYOUT` is now `6` —
   any `world.json` saved before this session retrains cleanly rather than being
   silently misread.
 - World model reports `under-trained` below 40 transitions rather than bluffing.
@@ -268,11 +286,12 @@ means destruction and flags `ls`.
    so an MLP could exploit it. Only `WorldModel.fit()` changes.
 4. **Learned encoder** — would make the JEPA half faithful to the paper (needs an
    EMA target encoder + stop-gradient to avoid representation collapse).
-5. **Audit the remaining `proc_run` action features for the same class of bug**
-   (session's lesson 5): `apps`/`memory`/`vault`/`data`/`mkdir`-family are exact
-   word matches, which is safer than substring matching, but they were not
-   stress-tested against a wide command sample the way `-rf` and length just
-   were. Worth the same 30-minute sweep before trusting them fully.
+
+All `proc_run` action features have now been audited for the unguarded-word
+bug class (lesson 5) — done this session, not a remaining item. The `mkdir`/
+`touch`/`cp`/`mv`/`tee` creation feature (`b+6`) was checked too and is fine
+standing alone: it is a positive "this creates something" signal, not a danger
+signal, so it is correctly *not* gated on `is_rm`.
 
 ---
 

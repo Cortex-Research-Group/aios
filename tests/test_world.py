@@ -537,6 +537,29 @@ class TestBootstrapAndDestruction(unittest.TestCase):
         self.assertEqual(r["direction"], "removes")
         self.assertTrue(r["destructive"])
 
+    def test_mentioning_a_directory_without_deleting_is_not_destructive(self):
+        """Same bug class as the -rf flag matcher, in the apps/memory/vault/data
+        features: they used to fire on the word alone, so any command that
+        merely *mentions* one of those directories -- reading a file inside it,
+        curling a URL with 'apps' in the path, making a new one -- inherited
+        part of rm's learned effect on that directory. `mkdir apps/x` came out
+        flagged destructive for creating something. These features are only
+        informative in the context of an actual deletion; they must now be
+        gated on an rm-family word being present in the same command.
+        """
+        for cmd in ("cat apps/solwatch/main.py", "ls apps/", "cat memory/note.md",
+                   "cp apps/x/main.py apps/y/main.py", "curl https://api.example.com/apps/list",
+                   "wc -l memory/*.md", "mkdir apps/newapp", "touch data/new.txt"):
+            r = self.explain("proc_run", {"command": cmd})
+            self.assertFalse(r["destructive"], f"{cmd!r} wrongly flagged destructive")
+
+    def test_deleting_named_directories_is_still_flagged(self):
+        """The gate above must not blunt the feature it is protecting."""
+        for cmd in ("rm -rf apps", "rm -rf apps/x", "rm memory/note-1.md",
+                   "rm -rf memory", "rm -rf data", "rm -rf vault", "rmdir apps/x"):
+            r = self.explain("proc_run", {"command": cmd})
+            self.assertTrue(r["destructive"], f"{cmd!r} should still be flagged destructive")
+
     def test_creation_is_not_flagged_destructive(self):
         for name, args in (
             ("fs_write", {"path": "/data/n.txt", "content": "x" * 500}),
