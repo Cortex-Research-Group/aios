@@ -62,7 +62,7 @@ _SYSCALL_SLOTS = 20
 # the argument features live while D_ACTION stays 32, so dimensions alone cannot
 # tell a stale saved model from a current one -- it would load and be silently
 # misinterpreted. Bump this whenever the meaning of a slot moves.
-LAYOUT = 2
+LAYOUT = 5
 
 _PROC_BASE = _SYSCALL_SLOTS       # 20..27: what a shell command intends
 _CONTENT = _PROC_BASE + 8         # 28: size of the payload being written
@@ -140,6 +140,23 @@ def encode_state(root: Path | None = None) -> list[float]:
     return v
 
 
+def _is_force_recursive_flag(word: str) -> bool:
+    """True for -r, -f, -rf, -fr, --recursive, --force -- the flags that turn
+    `rm` from one file into a subtree.
+
+    Not simple substring matching: `w.startswith("-") and ("r" in w or "f" in w)`
+    also matched `--version`, `--force` unrelated to deletion, `--verbose`, and
+    any other long flag that merely contains the letter r or f somewhere in its
+    name. Measured, that made `python3 --version` predict as destructive.
+    """
+    body = word.lstrip("-")
+    if not body:
+        return False
+    if word.startswith("--"):
+        return body in ("recursive", "force")
+    return bool(body) and set(body) <= {"r", "f"}
+
+
 def encode_action(name: str, args: dict | None = None) -> list[float]:
     """Embed a proposed syscall.
 
@@ -164,14 +181,26 @@ def encode_action(name: str, args: dict | None = None) -> list[float]:
         b = _PROC_BASE
         cmd = str(args.get("command", "")).lower()
         words = cmd.replace("/", " ").split()
-        v[b + 0] = 1.0 if any(w in ("rm", "rmdir", "unlink", "shred", "truncate", "dd") for w in words) else 0.0
-        v[b + 1] = 1.0 if any(w.startswith("-") and ("r" in w or "f" in w) for w in words) else 0.0
+        is_rm = any(w in ("rm", "rmdir", "unlink", "shred", "truncate", "dd") for w in words)
+        v[b + 0] = 1.0 if is_rm else 0.0
+        # Tied to an rm-family word being present, not judged on its own: -r and
+        # -f are ordinary flags for grep, tar, curl and a dozen other commands
+        # that do not delete anything. Only in the context of rm does "recursive,
+        # force" mean "no confirmation, no going back".
+        v[b + 1] = 1.0 if is_rm and any(_is_force_recursive_flag(w) for w in words) else 0.0
         v[b + 2] = 1.0 if "apps" in words else 0.0
         v[b + 3] = 1.0 if "memory" in words else 0.0
         v[b + 4] = 1.0 if "vault" in words else 0.0
         v[b + 5] = 1.0 if "data" in words else 0.0
         v[b + 6] = 1.0 if any(w in ("mkdir", "touch", "cp", "mv", "tee") for w in words) else 0.0
-        v[b + 7] = _scale(len(cmd), 200)
+        # b+7 was command length. Removed: it correlated with the destructive
+        # indicators by accident of the training set (deletions happened to be
+        # longer commands than `ls`), so ridge regression leaned on it as a proxy
+        # for danger. Measured, that made short *unseen* commands -- anything not
+        # literally in bootstrap()'s training set, starting with plain `ls` --
+        # predict as destructive purely for being short, regardless of content.
+        # Slot kept reserved (always 0) rather than reused, so D_ACTION and every
+        # slot after it do not shift again.
 
     # How much content is being written, for the calls that write content.
     if name in ("fs_write", "app_build", "mem_write"):
@@ -329,11 +358,18 @@ class WorldModel:
         # predicted change on the counting dimensions carries that.
         net = sum(pred[i] - idle[i] for i in (0, 1, 2, 3, 5))
         direction = "removes" if net < -1e-4 else ("creates" if net > 1e-4 else "none")
+        # destructive is direction alone -- any real removal, however small.
+        # It used to also require d >= self.scale, gating on the *median*
+        # disturbance across every effectful training action. That excludes half
+        # of all real deletions by construction: an ordinary single-file `rm`
+        # landed right at that median and silently failed to warn. The -1e-4
+        # threshold inside `direction` above is already the noise floor; a
+        # second, coarser one on top of it protected nothing and hid real risk.
         return {
             "disturbance": round(d, 4),
             "magnitude": self.risk(d),
             "direction": direction,
-            "destructive": direction == "removes" and d >= (self.scale or 0),
+            "destructive": direction == "removes",
             "predicted_changes": deltas,
             "reliable": self.is_reliable,
             "trained_on": self.trained_on,

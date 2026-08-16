@@ -275,6 +275,12 @@ real root.
   a nonlinear predictor can use it later without re-gathering data.
 - With few transitions it says so (`under-trained`) rather than emitting
   confident nonsense.
+- `destructive` is the predicted *direction* alone (does this remove things),
+  not direction gated by how large the removal is. It used to also require the
+  disturbance to clear `scale`, the median effect size across the training set
+  — which by construction misses half of all real deletions, including an
+  ordinary single-file `rm`. Losing one file is worth a warning regardless of
+  whether it's a typical-sized action for this machine.
 
 ## Syscalls
 
@@ -297,11 +303,13 @@ world model trains on.
 python3 -m unittest discover -s tests -v
 ```
 
-169 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
+172 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
 filesystem jail, the permission gate, memory ranking, the app lifecycle,
 build-time smoke checks, the kernel loop against a scripted model, executor
 delegation, OpenRouter wire-format parsing, offline degradation, scheduling
 (including that a job cannot name a raw command, that secrets stay confined to
 what the app declared, and that a missed schedule is not replayed), and the world
 model — including that it beats the do-nothing baseline, flags deletions as
-destructive, and predicts exactly zero for read-only syscalls.
+destructive regardless of size, predicts exactly zero for read-only syscalls
+(including ones it never saw verbatim in training), and does not mistake an
+ordinary flag like `--version` for `-rf`.

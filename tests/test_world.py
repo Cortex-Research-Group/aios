@@ -177,6 +177,46 @@ class TestLearning(unittest.TestCase):
         with self.assertRaises(ValueError):
             world.WorldModel().fit([])
 
+    def test_destructive_does_not_depend_on_scale(self):
+        """destructive must be direction alone, not direction gated by magnitude.
+
+        Built so most training removals are large (effect -0.10) and `scale`
+        -- the median disturbance -- lands close to that. A small removal
+        (-0.002, twenty times smaller) still needs to be flagged: losing one
+        file is destructive regardless of whether it is typical for this
+        machine. This is what regressed before: the gate used to require
+        d >= scale, so anything below the *typical* removal size passed
+        silently, and that included ordinary single-file deletions.
+        """
+        import random
+
+        rng = random.Random(11)
+        grow = world.encode_action("app_build", {"name": "x", "code": "y"})
+        big_shrink = world.encode_action("proc_run", {"command": "rm -rf apps"})
+        small_shrink = world.encode_action("proc_run", {"command": "rm data/f1.txt"})
+        noop = world.encode_action("fs_read", {"path": "/aios.json"})
+
+        samples = []
+        for _ in range(300):
+            state = [rng.uniform(0, 1) for _ in range(world.D_STATE)]
+            action, effect = rng.choice(
+                [(grow, 0.10), (big_shrink, -0.10), (small_shrink, -0.005), (noop, 0.0)]
+            )
+            nxt = list(state)
+            for i in (0, 1, 3, 4):
+                nxt[i] += effect
+            samples.append((state, action, nxt))
+
+        wm = world.WorldModel()
+        wm.fit(samples)
+        state = [0.5] * world.D_STATE
+
+        big = wm.explain(state, big_shrink)
+        small = wm.explain(state, small_shrink)
+        self.assertLess(small["disturbance"], wm.scale, "test setup: small removal should be sub-median")
+        self.assertTrue(big["destructive"])
+        self.assertTrue(small["destructive"], "a below-median removal must still be flagged")
+
 
 class TestPersistence(unittest.TestCase):
     def setUp(self):
@@ -464,6 +504,38 @@ class TestBootstrapAndDestruction(unittest.TestCase):
     def test_deleting_apps_predicts_fewer_apps(self):
         r = self.explain("proc_run", {"command": "rm -rf apps"})
         self.assertLess(r["predicted_changes"].get("app count", 0), 0)
+
+    def test_unseen_benign_commands_are_not_flagged_destructive(self):
+        """A read-only command the model never saw verbatim must not inherit a
+        deletion's score just for being short.
+
+        Regression: the action encoder used to feature the raw command length.
+        Only 'ls -la' was ever in the training set, and destructive commands
+        (rm -rf apps/bootN, rm memory/note-N.md) happened to be longer, so ridge
+        regression leaned on length as a proxy for danger. Bare `ls` -- never
+        seen in training, and shorter than every trained example -- came out
+        predicted disturbance 0.0194 against a scale of 0.0145: flagged
+        destructive for listing a directory. None of these commands touch the
+        filesystem at all; they must predict exactly zero disturbance.
+        """
+        for cmd in ("ls", "ls -l", "pwd", "whoami", "date", "git status",
+                   "python3 --version", "df -h", "curl -O https://example.com",
+                   "tar -xvf x.tar", "grep -r foo .", "npm --force-color"):
+            r = self.explain("proc_run", {"command": cmd})
+            self.assertFalse(r["destructive"], f"{cmd!r} wrongly flagged destructive")
+            self.assertEqual(r["disturbance"], 0.0, f"{cmd!r} should predict zero disturbance")
+
+    def test_single_file_deletion_is_flagged_destructive(self):
+        """The magnitude gate that used to sit on top of direction ('removes')
+        was the *median* disturbance across every effectful training action --
+        which, by construction, misses half of them. An ordinary single-file
+        `rm` landed almost exactly on that median and was silently let through
+        without a warning. Losing one file to an unattended `rm` is exactly the
+        case a permission prompt exists for.
+        """
+        r = self.explain("proc_run", {"command": "rm data/f1.txt"})
+        self.assertEqual(r["direction"], "removes")
+        self.assertTrue(r["destructive"])
 
     def test_creation_is_not_flagged_destructive(self):
         for name, args in (

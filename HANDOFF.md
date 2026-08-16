@@ -3,7 +3,7 @@
 Written so a fresh session can resume with no prior context. Read this, then
 `README.md` for the user-facing description.
 
-**State:** working, 169 tests green, everything committed.
+**State:** working, 172 tests green, everything committed.
 Nothing in flight, nothing half-finished.
 
 ---
@@ -38,7 +38,7 @@ modal run build/modal/aios_modal.py::status     # what the volume holds
 modal run build/modal/aios_modal.py::selftest   # prove sandbox capability enforcement
 modal run build/modal/aios_modal.py::smoke      # one real agent turn, no TTY needed
 modal run build/modal/aios_modal.py::local_brain  # GPU, self-hosted Qwen2.5-7B
-python3 -m unittest discover -s tests           # 169 tests
+python3 -m unittest discover -s tests           # 172 tests
 ```
 
 **The interactive shell needs a TTY, which an agent session cannot drive.** Use
@@ -91,8 +91,10 @@ build/          provision.sh (VPS/VM), deploy.sh (over SSH), modal/, vm/
   `NETWORK_REACHABLE` vs `NETWORK_BLOCKED`. Not asserted, measured.
 - Live OpenRouter turn: built and ran a `clock` app end to end (~$0.095, 40s).
 - Local GPU brain: Qwen2.5-7B via vLLM built and self-corrected a `dice` app in 20.6s.
-- World model: beats do-nothing baseline; flags deletions destructive; read-only
-  syscalls predict exactly 0.0000.
+- World model: beats do-nothing baseline; flags deletions destructive regardless
+  of size; read-only syscalls predict exactly 0.0000, including ones never seen
+  verbatim in training. Swept 33 representative commands (23 benign, 10
+  destructive) against a freshly bootstrapped model: 0 misclassifications.
 - Modal volume persistence across separate invocations.
 - **Scheduling, end to end on a real clock.** Built a `ticker` app, scheduled it
   `every 30s`, started the detached daemon: fired at 19:03:05 and 19:03:35, exit 0
@@ -138,6 +140,40 @@ usage predicted `rm -rf /apps` would *increase* the app count — it had never s
 a deletion. `world.bootstrap()` practises in a throwaway root. It must also
 include *harmless* `proc_run` commands, or the model learns `proc_run` itself
 means destruction and flags `ls`.
+
+5. **A feature that *can* be true for a benign command will eventually be true
+   for one.** The `proc_run` action encoding had two features doing substring or
+   pattern matching without enough context, and both let something harmless
+   through as destructive:
+   - `command length`, scaled 0–4 — correlated with the destructive indicators
+     purely by accident of the training set (deletions in `bootstrap()` happened
+     to be longer than `ls -la`). Ridge regression leaned on it as a danger
+     proxy, so any short *unseen* command — literally `ls` typed alone, never in
+     the training set — predicted destructive regardless of content. Fix:
+     deleted the feature; slot kept reserved rather than reused.
+   - `w.startswith("-") and ("r" in w or "f" in w)`, meant to catch `-rf` — also
+     matched `--version`, `--force-color`, `--verbose`, anything with r or f
+     anywhere in a long flag name. `python3 --version` predicted destructive.
+     Fix: `_is_force_recursive_flag()` matches only `-r`/`-f`/`-rf`/`-fr` or
+     `--recursive`/`--force` exactly, **and** only counts when an actual
+     `rm`-family word is also present in the command — so `grep -r` or
+     `tar -xvf` don't trigger it on their own.
+   Both were **already wrong at the commit that introduced the world model**,
+   not something scheduling broke — removing the length feature just stopped it
+   from masking the flag bug on some inputs. A 33-command sweep (23 benign, 10
+   destructive) now returns 0 misclassifications; see `TestBootstrapAndDestruction`.
+
+6. **The destructive gate should be direction alone, not direction gated by
+   typical size.** `explain()` required `d >= self.scale`, where `scale` is the
+   *median* disturbance across every effectful training action — which, by
+   construction, is below half of them. An ordinary single-file `rm` landed
+   almost exactly on that median and silently passed the gate. Losing one file
+   to an unattended job is exactly the case a permission prompt exists for,
+   regardless of whether it's a "typical-sized" action for this machine. Fixed:
+   `destructive = direction == "removes"`, full stop — the `-1e-4` noise floor
+   already lives inside `direction`, so a second, coarser threshold on top of it
+   protected nothing. `scale` still has a job: `risk()` uses it to rank magnitude
+   for display, which is a different question from "is this reversible."
 
 ### Scheduling
 - **A job may run an installed app and nothing else.** No syscall schedules a raw
@@ -205,21 +241,17 @@ means destruction and flags `ls`.
   in front of it; `/sched stop` when you care.
 - **Offline: the agent cannot think.** OpenRouter is remote. Installed apps,
   memory, `fs_*` and the shell all keep working; failures are legible, not tracebacks.
-- **`proc_run: ls` is wrongly flagged destructive.** An earlier version of this
-  file claimed it predicted −0.007 and was "not escalated". That is wrong, and was
-  wrong at `a1cc896` too — measured, `ls` predicts disturbance 0.0194 against a
-  scale of 0.0145, so `destructive=True` and the prompt warns about a directory
-  listing. Two causes, both pre-dating scheduling: the `proc_run` identity slot
-  absorbs the average effect of all `proc_run` samples (mostly deletions in
-  `bootstrap()`), and the command-length feature is junk that soaks up variance —
-  `echo hello` scores *lower* than `ls` purely because it is longer.
-  Adding 1–2 rounds of extra benign `proc_run` commands to `bootstrap()` fixes it
-  (`ls` → 0.0130, ok; `rm -rf apps` → 0.0725, still destructive), but 5+ rounds
-  re-breaks it, because `scale` is the median over nonzero disturbances and
-  collapses as benign samples are added. That knife-edge is the real defect:
-  **the calibration should not depend on the action mix of the training set.**
-  Fix `scale` first (a quantile over actions that actually changed the state, say),
-  then rebalance. Crying wolf on `ls` teaches users to click through the gate.
+- **`proc_run: ls` was wrongly flagged destructive — fixed this session.** An
+  earlier version of this file claimed it predicted −0.007 and was "not
+  escalated"; that was wrong, and was wrong at `a1cc896` too. Root causes were
+  the command-length feature and an overbroad `-rf` flag matcher, both described
+  under "World model" lesson 5 above, plus the destructive gate itself
+  (lesson 6). All three are fixed and covered by regression tests
+  (`test_unseen_benign_commands_are_not_flagged_destructive`,
+  `test_single_file_deletion_is_flagged_destructive`,
+  `test_destructive_does_not_depend_on_scale`). `world.LAYOUT` is now `5` —
+  any `world.json` saved before this session retrains cleanly rather than being
+  silently misread.
 - World model reports `under-trained` below 40 transitions rather than bluffing.
 - Qwen2.5-7B local brain works but is meaningfully worse than opus-5 at writing
   correct programs; it needed the build-time smoke check to self-correct.
@@ -228,17 +260,19 @@ means destruction and flags `ls`.
 
 ## Sensible next steps
 
-1. **Fix the destructive-threshold calibration** — `ls` currently trips the
-   destructive warning (see Known limitations). Smallest change with the clearest
-   safety payoff, and the measurements are already in this file.
-2. **VPS deploy** — still the only untested path that is cheap to verify, and now
+1. **VPS deploy** — still the only untested path that is cheap to verify, and now
    more valuable: it is the always-on box that makes scheduling worth having.
    Nothing about scheduling has been tried on a remote host.
-3. **Bare-metal USB** — the original goal; the Mac being pre-T2 helps.
-4. **Nonlinear world-model predictor** — the transitions already record state,
+2. **Bare-metal USB** — the original goal; the Mac being pre-T2 helps.
+3. **Nonlinear world-model predictor** — the transitions already record state,
    so an MLP could exploit it. Only `WorldModel.fit()` changes.
-5. **Learned encoder** — would make the JEPA half faithful to the paper (needs an
+4. **Learned encoder** — would make the JEPA half faithful to the paper (needs an
    EMA target encoder + stop-gradient to avoid representation collapse).
+5. **Audit the remaining `proc_run` action features for the same class of bug**
+   (session's lesson 5): `apps`/`memory`/`vault`/`data`/`mkdir`-family are exact
+   word matches, which is safer than substring matching, but they were not
+   stress-tested against a wide command sample the way `-rf` and length just
+   were. Worth the same 30-minute sweep before trusting them fully.
 
 ---
 
