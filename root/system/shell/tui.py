@@ -8,11 +8,12 @@ scrollback keeps working. That matters when this is booting a VM or a stick.
 import getpass
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-from kernel import agent, apps, llm, memory, paths, sandbox, syscalls, vault, world
+from kernel import agent, apps, llm, memory, paths, sandbox, schedule, syscalls, vault, world
 
 try:
     import readline  # noqa: F401  -- line editing and history, if available
@@ -66,6 +67,7 @@ class Shell:
         self.config = self._load_config()
         self.registry = apps.Registry(executor=self._build_executor())
         self.memory = memory.Memory()
+        self.schedule = schedule.Schedule()
         self.world = world.WorldModel.load()
         self.secrets: dict = {}
         self.kernel = None
@@ -132,6 +134,7 @@ class Shell:
         ctx = agent.Context(
             registry=self.registry,
             memory=self.memory,
+            schedule=self.schedule,
             secrets=self.secrets,
             model=model,
             autonomy=self.config["autonomy"],
@@ -150,6 +153,13 @@ class Shell:
         if self.world.is_trained:
             note = "" if self.world.is_reliable else "  (under-trained)"
             print(dim(f"  world  predictor trained on {self.world.trained_on} transitions{note}"))
+        jobs = self.schedule.all()
+        if jobs:
+            # Never auto-start the daemon: a job firing because you opened a
+            # shell is exactly the kind of surprise this OS should not spring.
+            live = schedule.running_pid()
+            state = f"daemon running (pid {live})" if live else yellow("daemon stopped -- /sched start")
+            print(dim(f"  sched  {len(jobs)} job{'s' if len(jobs) != 1 else ''}   ") + state)
         print(dim("  type /help for commands, or just say what you want\n"))
         return True
 
@@ -232,6 +242,17 @@ class Shell:
             return True
         self._break_stream()
         print(yellow(f"\n  {name} wants to run:"))
+
+        # The world model measures disturbance to the filesystem, and scheduling
+        # barely touches it -- one small file in data/. What makes a job worth a
+        # second look is invisible in embedding space: after this, that app runs
+        # on its own, repeatedly, with nobody approving each run. Say it in words.
+        if name == "sched_add":
+            app = self.registry.get(args.get("app", ""))
+            caps = ", ".join(app.caps) if app and app.caps else "none"
+            print(red("    ⚠ this runs unattended from now on -- no prompt per run"))
+            print(dim(f"      app capabilities: {caps}"))
+
         foresight = self.ctx.foresee(name, args)
         if foresight:
             caveat = "" if foresight["reliable"] else " (under-trained -- a hint, not a verdict)"
@@ -309,6 +330,97 @@ class Shell:
             print(red(r["stderr"].rstrip()))
         print(dim(f"  [{name} exit {r['code']} in {time.time() - t0:.1f}s]\n"))
 
+    # --- scheduling ----------------------------------------------------------
+
+    def _sched(self, arg: str):
+        sub, _, rest = arg.partition(" ")
+        rest = rest.strip()
+        self.schedule.load()  # the daemon owns this file too
+
+        if sub == "start":
+            return self._sched_start()
+
+        if sub == "stop":
+            print(green("  scheduler stopped\n") if schedule.stop() else dim("  not running\n"))
+            return None
+
+        if sub == "rm":
+            ok = self.schedule.remove(rest)
+            print(green(f"  unscheduled {rest}\n") if ok else red(f"  no such job: {rest}\n"))
+            return None
+
+        if sub in ("on", "off"):
+            job = self.schedule.set_enabled(rest, sub == "on")
+            print(green(f"  {rest} {'enabled' if sub == 'on' else 'disabled'}\n")
+                  if job else red(f"  no such job: {rest}\n"))
+            return None
+
+        if sub == "log":
+            rows = schedule.history(int(rest) if rest.isdigit() else 20)
+            if not rows:
+                print(dim("  nothing has run yet\n"))
+                return None
+            for r in rows:
+                mark = green("✓") if r.get("code") == 0 else red("✗")
+                first = (r.get("stdout") or r.get("stderr") or "").strip().split("\n")[0][:90]
+                print(f"  {mark} {dim(r.get('when', ''))} {bold(r.get('job', '?'))}  {first}")
+            print()
+            return None
+
+        jobs = self.schedule.all()
+        if not jobs:
+            print(dim("  no jobs scheduled -- ask the OS to run one of your apps on a schedule\n"))
+            return None
+        for j in jobs:
+            when = time.strftime("%H:%M:%S", time.localtime(j.next_run)) if j.enabled else "-"
+            state = "" if j.enabled else red(" disabled")
+            tally = dim(f"  {j.runs} runs, {j.failures} failed") if j.runs else dim("  never run")
+            print(f"  {bold(j.id):<24} {j.app} {' '.join(j.args)}".rstrip()
+                  + dim(f"  {schedule.describe(j)}, next {when}") + state + tally)
+        live = schedule.running_pid()
+        print(dim(f"  daemon: pid {live}\n") if live
+              else yellow("  daemon stopped -- jobs will not fire. /sched start\n"))
+        return None
+
+    def _sched_start(self):
+        """Launch the daemon as a detached child.
+
+        It inherits the unsealed vault through its environment so scheduled apps
+        get the secrets they declared -- the same mechanism a hosted deployment
+        uses. The keys stay in memory; nothing about this writes them to disk.
+        """
+        live = schedule.running_pid()
+        if live:
+            print(dim(f"  already running (pid {live})\n"))
+            return None
+
+        env = dict(os.environ)
+        env.update({k: v for k, v in self.secrets.items() if isinstance(v, str)})
+        env["AIOS_HOME"] = str(paths.HOME)
+
+        log = paths.LOGS / "schedd.out"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log.open("a", encoding="utf-8") as f:
+                proc = subprocess.Popen(
+                    [sys.executable, str(paths.SYSTEM / "aios.py"), "schedd"],
+                    cwd=str(paths.HOME), env=env, stdout=f, stderr=f,
+                    stdin=subprocess.DEVNULL, start_new_session=True,
+                )
+        except OSError as e:
+            print(red(f"  could not start scheduler: {e}\n"))
+            return None
+
+        # Popen returning is not proof it survived import; wait for the pidfile.
+        for _ in range(50):
+            time.sleep(0.1)
+            if schedule.running_pid():
+                print(green(f"  scheduler running (pid {proc.pid})"))
+                print(dim(f"  output: {paths.rel(log)}\n"))
+                return None
+        print(red("  scheduler did not come up -- see " + paths.rel(log) + "\n"))
+        return None
+
     # --- slash commands ------------------------------------------------------
 
     def _command(self, line: str):
@@ -334,6 +446,7 @@ class Shell:
   {bold('/models [filter]')}  browse available models
   {bold('/autonomy [mode]')}  ask | full | readonly
   {bold('/sandbox [mode]')}    off | modal -- where generated apps run
+  {bold('/sched')}            scheduled jobs; start|stop|rm|on|off|log
   {bold('/world [bootstrap|train]')}  predict a syscall's effect before running it
   {bold('/syscalls')}         list kernel syscalls
   {bold('/reset')}            clear the conversation, keep apps and memory
@@ -415,6 +528,9 @@ class Shell:
             else:
                 where = self.registry.executor.name if self.registry.executor else "subprocess"
                 print(f"  {where} " + dim("(off | modal)\n"))
+
+        elif cmd == "sched":
+            return self._sched(arg)
 
         elif cmd == "world":
             if arg == "train":

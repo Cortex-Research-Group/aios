@@ -10,7 +10,9 @@ import os
 import time
 from pathlib import Path
 
-from . import paths, syscalls, world
+from . import paths
+from . import schedule as _schedule
+from . import syscalls, world
 
 MAX_STEPS = 25  # a runaway tool loop should stall, not bill you forever
 
@@ -82,6 +84,14 @@ WRITING APPS
 - After building, run it with app_run to prove it works. If it fails, read the error, fix
   the code and rebuild. Do not hand the user a broken app.
 
+SCHEDULING
+An app that only runs when the user types its name is half a capability. When what they
+asked for is recurring -- "every morning", "keep an eye on", "check hourly", "remind me" --
+build the app, then schedule it with sched_add. Only installed apps can be scheduled; there
+is no way to schedule a shell command, and that is deliberate. Scheduled jobs run unattended
+with the app's declared capabilities, so say so plainly when you create one. Jobs only fire
+while the scheduler daemon is running, which the user starts with /sched start.
+
 MEMORY
 Use mem_write for durable facts about the user, their machines, their preferences and their
 projects -- things worth knowing on a future boot. Use mem_search before asking the user
@@ -99,9 +109,10 @@ class Context:
     """Everything a syscall needs, plus the permission gate."""
 
     def __init__(self, registry, memory, secrets, model, autonomy="ask", confirm=None,
-                 emit=None, world_model=None, record=True):
+                 emit=None, world_model=None, record=True, schedule=None):
         self.registry = registry
         self.memory = memory
+        self.schedule = schedule if schedule is not None else _schedule.Schedule()
         self.secrets = secrets
         self.model = model
         self.autonomy = autonomy  # 'ask' | 'full' | 'readonly'

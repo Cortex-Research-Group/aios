@@ -3,8 +3,8 @@
 Written so a fresh session can resume with no prior context. Read this, then
 `README.md` for the user-facing description.
 
-**State:** working, 123 tests green, everything committed (HEAD `7e1e022`).
-4,853 lines. Nothing in flight, nothing half-finished.
+**State:** working, 169 tests green, everything committed.
+Nothing in flight, nothing half-finished.
 
 ---
 
@@ -12,9 +12,9 @@ Written so a fresh session can resume with no prior context. Read this, then
 
 An agent OS whose userland it writes itself. You ask for a capability it lacks;
 it writes a Python program, installs it into `apps/`, and that program is a
-permanent command on every future boot. Two halves:
+permanent command on every future boot — optionally on a schedule. Two halves:
 
-- **Token-space half** — an LLM agent loop over 12 syscalls (the conventional part).
+- **Token-space half** — an LLM agent loop over 15 syscalls (the conventional part).
 - **Embedding-space half** — a JEPA-style world model that predicts what a syscall
   will do *before* it runs, so the permission gate can warn about irreversible
   actions (`kernel/world.py`).
@@ -32,12 +32,13 @@ lazily *only* when that backend is selected — do not break this.
 
 ```sh
 ./root/aios                                     # local; prompts for OpenRouter key + passphrase
+./root/aios schedd                              # the scheduling daemon, foreground
 modal run build/modal/aios_modal.py             # on Modal, interactive
 modal run build/modal/aios_modal.py::status     # what the volume holds
 modal run build/modal/aios_modal.py::selftest   # prove sandbox capability enforcement
 modal run build/modal/aios_modal.py::smoke      # one real agent turn, no TTY needed
 modal run build/modal/aios_modal.py::local_brain  # GPU, self-hosted Qwen2.5-7B
-python3 -m unittest discover -s tests           # 123 tests
+python3 -m unittest discover -s tests           # 169 tests
 ```
 
 **The interactive shell needs a TTY, which an agent session cannot drive.** Use
@@ -67,10 +68,11 @@ root/system/kernel/
   paths.py      the OS root + the jail check (AIOS_HOME binds at import time)
   vault.py      ChaCha20 + scrypt secret storage, verified against RFC 8439 vectors
   llm.py        any OpenAI-compatible endpoint (OpenRouter by default)
-  syscalls.py   THE SECURITY BOUNDARY. 12 primitives, all model access goes here
+  syscalls.py   THE SECURITY BOUNDARY. 15 primitives, all model access goes here
   apps.py       userland registry + static validation of generated code
   memory.py     markdown facts + TF-IDF search
   sandbox.py    optional Modal-confined app execution (lazy import)
+  schedule.py   job store, runner and daemon: apps that run unattended
   world.py      JEPA-style predictor: what will this syscall do?
   agent.py      the loop; also JSON repair and transition journaling
 root/system/shell/tui.py    terminal shell, permission prompts, slash commands
@@ -92,12 +94,23 @@ build/          provision.sh (VPS/VM), deploy.sh (over SSH), modal/, vm/
 - World model: beats do-nothing baseline; flags deletions destructive; read-only
   syscalls predict exactly 0.0000.
 - Modal volume persistence across separate invocations.
+- **Scheduling, end to end on a real clock.** Built a `ticker` app, scheduled it
+  `every 30s`, started the detached daemon: fired at 19:03:05 and 19:03:35, exit 0
+  both times, app data accumulated across runs, everything confined to the root.
+  `stop()` reaped the pidfile. Then backdated the job three days and restarted —
+  **one** run on resume, not the 8,640 it slept through.
 
 **Written but NOT verified:**
 - **Local VM** (`build/vm/run-vm.sh`) — blocked on qemu. Syntax-checked only.
 - **VPS deploy** (`build/deploy.sh`) — no box to try it on. The provisioner logic
   was tested locally against a temp prefix.
 - **USB bare-metal boot** — never attempted.
+- **Scheduling anywhere but this Mac.** The daemon has not run on Modal or a VPS.
+  Modal in particular is serverless — a container stops when you leave, so a
+  long-lived `schedd` there is not obviously meaningful. Untried, not designed for.
+- **`/sched start` from the interactive shell.** The daemon itself is verified,
+  but the spawn path lives in `tui.py`, which needs a TTY an agent cannot drive.
+  The daemon was launched directly (`aios.py schedd`) in every test above.
 
 ---
 
@@ -125,6 +138,26 @@ usage predicted `rm -rf /apps` would *increase* the app count — it had never s
 a deletion. `world.bootstrap()` practises in a throwaway root. It must also
 include *harmless* `proc_run` commands, or the model learns `proc_run` itself
 means destruction and flags `ls`.
+
+### Scheduling
+- **A job may run an installed app and nothing else.** No syscall schedules a raw
+  command or code, deliberately: a job runs with nobody watching, so it is limited
+  to artifacts whose capabilities the user already approved. It reuses
+  `Registry.run()`, so caps, sandbox and secret isolation are unchanged. There is
+  a test asserting no `sched_*` schema accepts `command` or `code` — keep it.
+- **Compute the next run forward from now, never from the missed slot.** Otherwise
+  a daemon that was off overnight wakes up and fires a 5m job hundreds of times,
+  each one possibly billing an API. Same rule when re-enabling a paused job.
+- **Adding a syscall shifts the world model's action layout.** `D_ACTION` stayed
+  32, so dimensions alone could not tell a stale `world.json` from a current one —
+  it would load cleanly and mean something different in every slot. Hence
+  `world.LAYOUT`; bump it whenever a slot's meaning moves.
+- **The world model cannot see what makes a job risky.** `sched_add` writes one
+  small file, so it correctly predicts ~0.0007, "low". That the app then runs
+  forever, unattended, is not a filesystem fact. The permission prompt states it
+  in words; do not try to make the embedding carry it.
+- Don't auto-start the daemon at boot. A job firing because someone opened a shell
+  is exactly the surprise this OS should not spring.
 
 ### Modal
 - **Never resolve local paths at module scope.** Modal re-imports the module inside
@@ -163,10 +196,30 @@ means destruction and flags `ls`.
   whatever your user account can. Real confinement requires `/sandbox modal`.
 - **`app_build` now executes what it installs** (the smoke run). Approving a build
   implies approving one run. Deliberate, disclosed, but it is a widening.
+- **A scheduled run is not gated.** Approving `sched_add` once approves every run
+  after it — that is what scheduling *is*, and the prompt says so, but it is the
+  widest grant in the system. Jobs are confined to installed apps for this reason.
+- **The daemon holds the unsealed vault in memory** for its lifetime, so scheduled
+  apps get the secrets they declared. Nothing writes them to disk. But a
+  long-running `schedd` is a process holding your keys with no passphrase prompt
+  in front of it; `/sched stop` when you care.
 - **Offline: the agent cannot think.** OpenRouter is remote. Installed apps,
   memory, `fs_*` and the shell all keep working; failures are legible, not tracebacks.
-- **`proc_run: ls` predicts a small spurious −0.007** — below the destructive
-  threshold so it is not escalated, but it is not zero either.
+- **`proc_run: ls` is wrongly flagged destructive.** An earlier version of this
+  file claimed it predicted −0.007 and was "not escalated". That is wrong, and was
+  wrong at `a1cc896` too — measured, `ls` predicts disturbance 0.0194 against a
+  scale of 0.0145, so `destructive=True` and the prompt warns about a directory
+  listing. Two causes, both pre-dating scheduling: the `proc_run` identity slot
+  absorbs the average effect of all `proc_run` samples (mostly deletions in
+  `bootstrap()`), and the command-length feature is junk that soaks up variance —
+  `echo hello` scores *lower* than `ls` purely because it is longer.
+  Adding 1–2 rounds of extra benign `proc_run` commands to `bootstrap()` fixes it
+  (`ls` → 0.0130, ok; `rm -rf apps` → 0.0725, still destructive), but 5+ rounds
+  re-breaks it, because `scale` is the median over nonzero disturbances and
+  collapses as benign samples are added. That knife-edge is the real defect:
+  **the calibration should not depend on the action mix of the training set.**
+  Fix `scale` first (a quantile over actions that actually changed the state, say),
+  then rebalance. Crying wolf on `ls` teaches users to click through the gate.
 - World model reports `under-trained` below 40 transitions rather than bluffing.
 - Qwen2.5-7B local brain works but is meaningfully worse than opus-5 at writing
   correct programs; it needed the build-time smoke check to self-correct.
@@ -175,10 +228,12 @@ means destruction and flags `ls`.
 
 ## Sensible next steps
 
-1. **VPS deploy** — the only untested path that is cheap to verify and gives the
-   always-on box Modal deliberately does not.
-2. **Scheduling** — the OS can build a tool but cannot run it every 5 minutes.
-   Probably the biggest usability gap.
+1. **Fix the destructive-threshold calibration** — `ls` currently trips the
+   destructive warning (see Known limitations). Smallest change with the clearest
+   safety payoff, and the measurements are already in this file.
+2. **VPS deploy** — still the only untested path that is cheap to verify, and now
+   more valuable: it is the always-on box that makes scheduling worth having.
+   Nothing about scheduling has been tried on a remote host.
 3. **Bare-metal USB** — the original goal; the Mac being pre-T2 helps.
 4. **Nonlinear world-model predictor** — the transitions already record state,
    so an MLP could exploit it. Only `WorldModel.fit()` changes.

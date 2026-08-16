@@ -40,7 +40,7 @@ The `root/` tree *is* the OS. Copy it anywhere; it never writes outside itself.
 |---|---|---|
 | **This machine** | `./root/aios` | Fastest way to use it. |
 | **Modal** | `modal run build/modal/aios_modal.py` | Persistent state on a Volume, and **real confinement** for generated apps. |
-| **VPS** | `./build/deploy.sh root@your-host` | Always-on. Your OS lives at an IP and keeps running when the laptop sleeps. |
+| **VPS** | `./build/deploy.sh root@your-host` | Always-on. Your OS lives at an IP, keeps running when the laptop sleeps, and is where [scheduled jobs](#scheduling) earn their keep. |
 | **Local VM** | `./build/vm/run-vm.sh -d` then `./build/deploy.sh` | Disposable Alpine boot. *Untested — needs a qemu that builds on your host.* |
 | **USB stick** | copy `root/` to the drive, run `./aios` | Portable. Bare-metal boot is the next milestone. |
 
@@ -99,6 +99,7 @@ root/                     the entire OS — this tree is the deliverable
 │   │   ├── apps.py       userland registry — install, version, run
 │   │   ├── memory.py     markdown facts + TF-IDF search
 │   │   ├── sandbox.py    optional confined execution (Modal), lazily imported
+│   │   ├── schedule.py   job store + the daemon that runs apps unattended
 │   │   ├── world.py      JEPA-style predictor: what will this syscall do?
 │   │   ├── vault.py      ChaCha20 + scrypt secret storage
 │   │   ├── llm.py        OpenRouter client (streaming, tool calls)
@@ -141,7 +142,10 @@ The agent writes code nobody reviewed, so the boundaries are explicit:
 - **Capability manifests** — an app declares `net`, `fs`, `proc`, `secrets` and you
   see them before it installs.
 - **Secret isolation** — an app receives only the vault keys it declared. One that
-  never asked for a key cannot read one. Tested.
+  never asked for a key cannot read one. Tested, including for scheduled runs.
+- **Scheduling is confined to apps** — a job runs with nobody at the keyboard, so
+  it can only run something already installed and approved, never a raw command.
+  See [Scheduling](#scheduling).
 - **Vault** — scrypt-derived key, ChaCha20, encrypt-then-MAC with HMAC-SHA256.
   Verified against the RFC 8439 test vectors in `tests/test_vault.py`.
 
@@ -169,6 +173,54 @@ RESULT: capability enforcement is REAL
 So: run adventurous prompts with `/sandbox modal`, not on your laptop. The local
 default is fine for code you'd have written yourself, and honest about being a
 disclosure mechanism rather than a jail.
+
+## Scheduling
+
+An app that only runs when you type its name is half a capability. `sched_add`
+makes one run on its own:
+
+```
+aios ∎ check solwatch every 15 minutes
+
+  · sched_add(app=solwatch, every=15m)
+
+  sched_add wants to run:
+    ⚠ this runs unattended from now on -- no prompt per run
+      app capabilities: net, fs
+  allow? [y/N/a=always] y
+
+scheduled. start the scheduler with /sched start.
+
+aios ∎ /sched start
+  scheduler running (pid 51849)
+```
+
+```sh
+/sched                 jobs, next run, pass/fail tallies
+/sched start | stop    the daemon
+/sched on|off <id>     pause a job without deleting it
+/sched rm <id>         unschedule (the app stays installed)
+/sched log             what actually ran
+```
+
+The daemon (`aios schedd`) is a separate process, because a schedule that only
+runs while a terminal is open is not a schedule. It is never auto-started — a job
+firing because you happened to open a shell is exactly the kind of surprise this
+OS should not spring. On a VPS it is what makes the always-on box worth having.
+
+**A scheduled job may run an installed app, and nothing else.** There is no
+syscall that schedules a shell command or a block of code, and that is the point:
+a job runs with nobody watching, so it is confined to artifacts whose capabilities
+you already saw and approved. It goes through the same runner as `app_run` —
+same caps, same sandbox backend, same "only the secrets it declared" rule.
+Scheduling grants no authority that running the app by hand would not. The one
+new power is *repetition without asking*, which is what the prompt above
+discloses.
+
+Missed runs are not made up. The next run is computed forward from now, so a
+daemon that was off for three days resumes with one run rather than the 8,640 it
+slept through — verified by stopping the daemon, backdating a job three days, and
+restarting it.
 
 ## The world model (the JEPA half)
 
@@ -234,6 +286,7 @@ real root.
 | `web_search` | DuckDuckGo, no API key needed |
 | `mem_write` `mem_search` | durable memory |
 | `app_build` `app_run` `app_list` `app_source` | the userland |
+| `sched_add` `sched_list` `sched_remove` | run an installed app on a schedule |
 
 Every syscall is journaled with a before/after state embedding, which is what the
 world model trains on.
@@ -244,9 +297,11 @@ world model trains on.
 python3 -m unittest discover -s tests -v
 ```
 
-123 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
+169 tests: RFC 8439 cipher vectors, vault round-trip and tamper detection, the
 filesystem jail, the permission gate, memory ranking, the app lifecycle,
 build-time smoke checks, the kernel loop against a scripted model, executor
-delegation, OpenRouter wire-format parsing, offline degradation, and the world
+delegation, OpenRouter wire-format parsing, offline degradation, scheduling
+(including that a job cannot name a raw command, that secrets stay confined to
+what the app declared, and that a missed schedule is not replayed), and the world
 model — including that it beats the do-nothing baseline, flags deletions as
 destructive, and predicts exactly zero for read-only syscalls.

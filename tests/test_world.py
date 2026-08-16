@@ -216,6 +216,31 @@ class TestPersistence(unittest.TestCase):
         p.write_text(json.dumps({"weights": [[1.0]], "trained_on": 99, "d_state": 4, "d_action": 4}))
         self.assertFalse(world.WorldModel.load(p).is_trained)
 
+    def test_layout_change_invalidates_the_model(self):
+        """The dimensions are not enough to tell a stale model from a current one.
+
+        Adding syscalls moves where the argument features sit inside the action
+        vector while D_ACTION stays put, so a model trained before the move would
+        load cleanly and mean something different in every slot. Retraining is
+        cheap; a silently misread predictor gating deletions is not.
+        """
+        p = self.dir / "world.json"
+        p.write_text(json.dumps({
+            "weights": [[0.0] * (world.D_STATE + world.D_ACTION)] * world.D_STATE,
+            "trained_on": 99,
+            "d_state": world.D_STATE,
+            "d_action": world.D_ACTION,
+            "layout": world.LAYOUT - 1,
+        }))
+        self.assertFalse(world.WorldModel.load(p).is_trained)
+
+    def test_a_model_saved_now_declares_the_current_layout(self):
+        wm = world.WorldModel()
+        wm.fit([([0.1] * world.D_STATE, world.encode_action("fs_write", {"path": "a"}),
+                 [0.2] * world.D_STATE)] * 50)
+        blob = json.loads(wm.save(self.dir / "world.json").read_text())
+        self.assertEqual(blob["layout"], world.LAYOUT)
+
 
 class TestTransitionLog(unittest.TestCase):
     def setUp(self):
@@ -449,6 +474,33 @@ class TestBootstrapAndDestruction(unittest.TestCase):
             r = self.explain(name, args)
             self.assertFalse(r["destructive"], f"{name} wrongly flagged destructive")
             self.assertEqual(r["direction"], "creates")
+
+    def test_scheduling_is_learned_as_quiet(self):
+        """Scheduling touches one small file in data/ and nothing else.
+
+        The model should say so rather than never having seen these syscalls.
+        What makes a job worth a second look -- that it then runs unattended,
+        forever -- is not visible in the filesystem at all, so the permission
+        prompt states it in words instead of leaning on this prediction.
+        """
+        for name, args in (
+            ("sched_add", {"app": "app1", "every": "5m"}),
+            ("sched_remove", {"id": "app1"}),
+            ("sched_list", {}),
+        ):
+            r = self.explain(name, args)
+            self.assertFalse(r["destructive"], f"{name} wrongly flagged destructive")
+            self.assertLess(r["disturbance"], self.stats["scale"],
+                            f"{name} should disturb less than an ordinary action")
+
+    def test_scheduling_is_distinguishable_from_deleting_apps(self):
+        """sched_remove unschedules a job; it does not uninstall anything. If the
+        two ever encode alike, the prompt would warn about the wrong thing."""
+        quiet = self.explain("sched_remove", {"id": "app1"})
+        loud = self.explain("proc_run", {"command": "rm -rf apps"})
+        self.assertLess(quiet["disturbance"], loud["disturbance"] / 10)
+        self.assertFalse(quiet["destructive"])
+        self.assertTrue(loud["destructive"])
 
     def test_app_build_predicts_more_apps(self):
         r = self.explain("app_build", {"name": "t", "description": "d", "spec": "s", "code": "print(1)"})

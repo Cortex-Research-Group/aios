@@ -51,8 +51,22 @@ RIDGE = 1e-3
 KNOWN_SYSCALLS = (
     "fs_read", "fs_write", "fs_list", "proc_run", "net_fetch", "web_search",
     "mem_write", "mem_search", "app_build", "app_run", "app_list", "app_source",
+    "sched_add", "sched_list", "sched_remove",
 )
-_SYSCALL_SLOTS = 16
+# Leave headroom above the known set: at exactly len(KNOWN_SYSCALLS) every
+# unknown name would share the one remaining bucket, which is the collision this
+# table exists to avoid.
+_SYSCALL_SLOTS = 20
+
+# The layout of the action vector, not its length. Adding syscalls shifts where
+# the argument features live while D_ACTION stays 32, so dimensions alone cannot
+# tell a stale saved model from a current one -- it would load and be silently
+# misinterpreted. Bump this whenever the meaning of a slot moves.
+LAYOUT = 2
+
+_PROC_BASE = _SYSCALL_SLOTS       # 20..27: what a shell command intends
+_CONTENT = _PROC_BASE + 8         # 28: size of the payload being written
+assert _CONTENT < D_ACTION, "action features no longer fit in D_ACTION"
 
 # Below this many transitions the model is fitting noise and should say so
 # rather than quietly emitting confident nonsense.
@@ -135,33 +149,34 @@ def encode_action(name: str, args: dict | None = None) -> list[float]:
     args = args or {}
     v = [0.0] * D_ACTION
 
-    # 0..15 -- identity. One slot per known syscall; unknown names hash into the
-    # tail so a syscall added later cannot steal a trained slot.
+    # 0.._SYSCALL_SLOTS-1 -- identity. One slot per known syscall; unknown names
+    # hash into the tail so a syscall added later cannot steal a trained slot.
     if name in KNOWN_SYSCALLS:
         v[KNOWN_SYSCALLS.index(name)] = 1.0
     else:
         v[len(KNOWN_SYSCALLS) + _bucket(name, _SYSCALL_SLOTS - len(KNOWN_SYSCALLS))] = 1.0
 
-    # 16..23 -- what a shell command intends. Scoped to proc_run on purpose:
+    # _PROC_BASE.. -- what a shell command intends. Scoped to proc_run on purpose:
     # features shared across syscalls leak learned effects between them. Hashed
     # argument tokens were worse still -- an unseen path landed in a bucket
     # trained on deletions, and a harmless read inherited its predicted damage.
     if name == "proc_run":
+        b = _PROC_BASE
         cmd = str(args.get("command", "")).lower()
         words = cmd.replace("/", " ").split()
-        v[16] = 1.0 if any(w in ("rm", "rmdir", "unlink", "shred", "truncate", "dd") for w in words) else 0.0
-        v[17] = 1.0 if any(w.startswith("-") and ("r" in w or "f" in w) for w in words) else 0.0
-        v[18] = 1.0 if "apps" in words else 0.0
-        v[19] = 1.0 if "memory" in words else 0.0
-        v[20] = 1.0 if "vault" in words else 0.0
-        v[21] = 1.0 if "data" in words else 0.0
-        v[22] = 1.0 if any(w in ("mkdir", "touch", "cp", "mv", "tee") for w in words) else 0.0
-        v[23] = _scale(len(cmd), 200)
+        v[b + 0] = 1.0 if any(w in ("rm", "rmdir", "unlink", "shred", "truncate", "dd") for w in words) else 0.0
+        v[b + 1] = 1.0 if any(w.startswith("-") and ("r" in w or "f" in w) for w in words) else 0.0
+        v[b + 2] = 1.0 if "apps" in words else 0.0
+        v[b + 3] = 1.0 if "memory" in words else 0.0
+        v[b + 4] = 1.0 if "vault" in words else 0.0
+        v[b + 5] = 1.0 if "data" in words else 0.0
+        v[b + 6] = 1.0 if any(w in ("mkdir", "touch", "cp", "mv", "tee") for w in words) else 0.0
+        v[b + 7] = _scale(len(cmd), 200)
 
-    # 24 -- how much content is being written, for the calls that write content.
+    # How much content is being written, for the calls that write content.
     if name in ("fs_write", "app_build", "mem_write"):
         payload = args.get("content") or args.get("code") or ""
-        v[24] = _scale(len(str(payload)), 4000)
+        v[_CONTENT] = _scale(len(str(payload)), 4000)
 
     return v
 
@@ -354,6 +369,7 @@ class WorldModel:
             "scale": self.scale,
             "d_state": D_STATE,
             "d_action": D_ACTION,
+            "layout": LAYOUT,
             "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
         }), encoding="utf-8")
         return path
@@ -367,8 +383,12 @@ class WorldModel:
             blob = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return cls()
-        # A model trained under different dimensions cannot be interpreted.
+        # A model trained under different dimensions cannot be interpreted --
+        # and neither can one trained under a different slot layout, which the
+        # dimensions alone would not catch. Retrain rather than mislead.
         if blob.get("d_state") != D_STATE or blob.get("d_action") != D_ACTION:
+            return cls()
+        if blob.get("layout") != LAYOUT:
             return cls()
         return cls(blob.get("weights"), blob.get("trained_on", 0), blob.get("scale", 0.0))
 
@@ -461,6 +481,22 @@ def bootstrap(rounds: int = 25) -> list[tuple]:
             act("fs_list", {"path": "/"}, lambda: None)
             act("app_list", {}, lambda: None)
             act("mem_search", {"query": "note"}, lambda: None)
+
+            # --- scheduling: rewrites one small file in data/, and that is all.
+            # Worth practising anyway, so the model learns these are quiet rather
+            # than never having seen them. Adding grows that file and removing
+            # shrinks it, so the two are not taught as the same event. The part
+            # the filesystem cannot show -- that the job then runs unattended,
+            # repeatedly -- is carried by the permission prompt, in words.
+            jobs_file = scratch / "data" / "schedule.json"
+
+            def write_jobs(n):
+                jobs_file.write_text('{"jobs": [' + '{"a": 1},' * n + "{}]}")
+
+            act("sched_add", {"app": f"boot{i}", "every": "5m"},
+                lambda i=i: write_jobs(i + 1))
+            act("sched_list", {}, lambda: None)
+            act("sched_remove", {"id": f"boot{i}"}, lambda i=i: write_jobs(i))
 
             # --- destruction: the whole reason this function exists ---
             if i >= 3:

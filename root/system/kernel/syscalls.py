@@ -12,13 +12,14 @@ names to [a-zA-Z0-9_-].
 import html
 import json
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 
-from . import paths
+from . import paths, schedule
 from .apps import CAPABILITIES, AppError, validate
 
 MAX_OUTPUT = 20000  # chars returned to the model from any one syscall
@@ -93,6 +94,8 @@ def dispatch(name: str, args: dict, ctx) -> str:
     except PermissionError as e:
         return f"denied: {e}"
     except AppError as e:
+        return f"error: {e}"
+    except schedule.ScheduleError as e:
         return f"error: {e}"
     except Exception as e:  # a broken syscall must not kill the kernel
         return f"error: {type(e).__name__}: {e}"
@@ -536,3 +539,91 @@ def _app_source(args, ctx):
     if not app:
         return f"error: no such app: {args['name']}"
     return f"# spec.md\n{app.spec}\n\n# main.py\n{app.code}"
+
+
+# --- scheduling ---------------------------------------------------------------
+#
+# Scheduling can only repeat something already installed. There is deliberately
+# no syscall to schedule a shell command or a syscall: a job runs with nobody
+# watching, so it is confined to apps, whose capabilities the user saw and
+# approved at build time. See kernel/schedule.py.
+
+
+@syscall(
+    "sched_add",
+    (
+        "Schedule an installed app to run automatically, on an interval or daily at a "
+        "set time. This is how a capability you built becomes something that keeps "
+        "working without the user asking. Only installed apps can be scheduled -- build "
+        "the app first. The user must start the scheduler daemon (/sched start) for jobs to fire."
+    ),
+    {
+        "type": "object",
+        "properties": {
+            "app": {"type": "string", "description": "Name of an installed app"},
+            "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed on every run"},
+            "every": {"type": "string", "description": "Interval, e.g. '30s', '5m', '2h', '1d'. Minimum 30s."},
+            "at": {"type": "string", "description": "Daily local time, e.g. '09:30'. Use instead of every, not with it."},
+        },
+        "required": ["app"],
+    },
+    mutating=True,
+)
+def _sched_add(args, ctx):
+    name = args["app"]
+    app = ctx.registry.get(name)
+    if not app:
+        return f"error: no such app: {name} -- build it with app_build first, then schedule it"
+
+    every, at = args.get("every"), args.get("at")
+    if every is None and at is None:
+        return "error: give every (an interval like '5m') or at (a daily time like '09:30')"
+
+    job = ctx.schedule.add(name, args.get("args") or [], every=every, at=at)
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job.next_run))
+    lines = [
+        f"scheduled '{job.app}' {schedule.describe(job)} (job id: {job.id}); first run {when}.",
+        f"  it will run unattended, with the capabilities it declared: {', '.join(app.caps) or 'none'}.",
+    ]
+    if schedule.running_pid() is None:
+        lines.append("  the scheduler daemon is not running -- tell the user to start it with /sched start.")
+    return "\n".join(lines)
+
+
+@syscall(
+    "sched_list",
+    "List scheduled jobs, when each next runs, and how the last run went.",
+    {"type": "object", "properties": {}},
+)
+def _sched_list(args, ctx):
+    jobs = ctx.schedule.all()
+    if not jobs:
+        return "no jobs scheduled"
+    rows = []
+    for j in jobs:
+        state = "enabled" if j.enabled else "disabled"
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(j.next_run)) if j.enabled else "-"
+        last = "never run" if not j.runs else f"last exit {j.last_code}, {j.runs} runs, {j.failures} failed"
+        rows.append(
+            f"{j.id}: {j.app} {' '.join(j.args)}".rstrip()
+            + f" -- {schedule.describe(j)} [{state}], next {when}; {last}"
+        )
+    daemon = "running" if schedule.running_pid() else "NOT running (jobs will not fire)"
+    return "\n".join(rows) + f"\n\nscheduler daemon: {daemon}"
+
+
+@syscall(
+    "sched_remove",
+    "Remove a scheduled job by its id. The app stays installed.",
+    {
+        "type": "object",
+        "properties": {"id": {"type": "string", "description": "Job id from sched_list"}},
+        "required": ["id"],
+    },
+    mutating=True,
+)
+def _sched_remove(args, ctx):
+    job_id = args["id"]
+    if ctx.schedule.remove(job_id):
+        return f"unscheduled {job_id} (the app is still installed)"
+    return f"error: no such job: {job_id}"
