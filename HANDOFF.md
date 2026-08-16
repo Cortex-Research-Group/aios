@@ -49,7 +49,7 @@ live-API claim in this repo was verified.
 
 ## Environment facts (specific to this user)
 
-- Modal workspace `nftmansa`, authenticated, CLI 1.5.3.
+- Modal workspace `<your-modal-workspace>`, authenticated, CLI 1.5.3.
 - Modal secret **`openrouter-api-key`** exposes `OPENROUTER_API_KEY`.
 - Volumes: `aios-root` (the OS), `aios-app-data` (sandboxed app scratch),
   `aios-hf-cache` (model weights).

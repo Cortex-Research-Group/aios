@@ -1,5 +1,7 @@
 # aiOS
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An operating system whose userland is written by the operating system, on demand.
 
 Ask it for a capability it does not have. It writes the program, installs it, and
