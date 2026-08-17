@@ -112,17 +112,16 @@ of the `AIOSDATA` partition. That installs python3, sets aiOS as the console
 session, and commits the config with Alpine's `lbu`, so every boot after that
 needs no login and no network at all.
 
-**Be honest about what "bootable" means here.** This session verified the
-parts that can be verified without booting anything: the ISO's checksum, that
-the assembled image mounts and its data partition matches the source tree
-byte-for-byte, that the MBR patch changes only the 10 bytes it's supposed to
-and nothing else, and the full `--device` write path (including the
-confirmation prompt) against a real virtual disk. It did **not** verify that
-a real machine's firmware actually boots from the result — that needs either
-qemu (fails to build on this class of Mac; see `HANDOFF.md`) or a real stick
-in a real machine, and this session had neither. Try it and it works: great,
-that closes the gap. Try it and it doesn't: the MBR-patch reasoning in
-`HANDOFF.md` is the place to start debugging, not the safety gates.
+**Be honest about what "bootable" means here.** Real firmware booting the
+patched MBR is now verified — tested in UTM (Virtualize/HVF, a genuine BIOS
+boot path, not a shortcut around one): `/dev/sda3` comes up correctly labeled
+`AIOSDATA` and mounts clean. See `HANDOFF.md` → "Bootable USB" for the exact
+VM setup (there's a drive-type gotcha worth reading before you hit it
+yourself) and for what's still open: `provision-usb.sh`'s first real run
+surfaced a BusyBox-vs-util-linux `blkid` incompatibility, fixed but not yet
+exercised end to end, and nobody has watched a stick reboot into aiOS
+unattended yet. Physical hardware hasn't been tried at all. If you get
+further than `HANDOFF.md` records: report back either way.
 
 ## Architecture
 

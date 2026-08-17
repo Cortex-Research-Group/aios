@@ -5,18 +5,29 @@
 #
 #   login: root          (Alpine's live media default -- no password)
 #   # setup-interfaces -a && udhcpc                    (only if not on DHCP)
-#   # mount -o ro /media/*/AIOSBOOT/provision-usb.sh /tmp 2>/dev/null; sh /media/*/provision-usb.sh
+#   # mkdir -p /media/AIOSDATA && mount /dev/sda3 /media/AIOSDATA
+#   # sh /media/AIOSDATA/provision-usb.sh
 #
-# make-usb.sh prints the exact command for the stick it just built. After this
-# script finishes and reboots, every later boot is unattended: no login, no
-# network, aiOS on the console within seconds.
+# The exact device node (/dev/sda3 above) depends on drive geometry and is not
+# guaranteed -- run `blkid` first if sda3 isn't it; look for the line with
+# LABEL="AIOSDATA". This script locates it the same way once it's running (see
+# find_data_dev() below), so this manual step is only needed to reach the
+# script's own bytes in the first place.
+#
+# make-usb.sh prints this same sequence for the stick it just built. After
+# this script finishes and reboots, every later boot is unattended: no login,
+# no network, aiOS on the console within seconds.
 #
 # Every fact this script relies on about Alpine's lbu/apk mechanisms was
 # checked against the actual alpine-conf package source (lbu, lbu_commit,
-# setup-apkcache), not documentation or memory -- see HANDOFF.md. What is
-# NOT verified is that Alpine's boot-time apkovl scan actually finds and
-# restores this on a real reboot: that needs a real boot, which this session
-# had no way to perform. Say so if you try it and it doesn't come back clean.
+# setup-apkcache), not documentation or memory -- see HANDOFF.md.
+#
+# Verified end to end in a UTM VM (real BIOS boot, not qemu -- see HANDOFF.md
+# for why qemu itself was unavailable): the patched MBR is read correctly by
+# the kernel, /dev/sda3 shows up labeled AIOSDATA and mounts clean. The first
+# real run of this script found and fixed the bug below (`blkid -L` -- see
+# find_data_dev()). What is NOT yet verified is the reboot: does Alpine's
+# boot-time apkovl scan actually bring the stick back with no login needed.
 set -eu
 
 LABEL="AIOSDATA"
@@ -25,12 +36,21 @@ MNT="/media/$LABEL"
 say() { printf '\033[36m::\033[0m %s\n' "$1"; }
 die() { printf '\033[31m!!\033[0m %s\n' "$1" >&2; exit 1; }
 
+# `blkid -L <label>` is util-linux; Alpine's live media ships BusyBox's blkid,
+# which only lists devices, no search flags. Confirmed on a real boot: -L
+# silently found nothing even with the partition present and labeled
+# correctly. Parse plain `blkid` output instead -- verified against this
+# exact BusyBox build's real output format, not assumed.
+find_data_dev() {
+    blkid 2>/dev/null | grep "LABEL=\"$1\"" | head -1 | cut -d: -f1
+}
+
 [ "$(id -u)" = "0" ] || die "run this as root"
 
 # --- locate and mount the data partition ---------------------------------
 
 say "looking for the $LABEL partition"
-DEV="$(blkid -L "$LABEL" 2>/dev/null || true)"
+DEV="$(find_data_dev "$LABEL")"
 [ -n "$DEV" ] || die "no partition labeled $LABEL -- is this a stick make-usb.sh built?"
 mkdir -p "$MNT"
 if ! mountpoint -q "$MNT"; then
@@ -97,7 +117,7 @@ say "installing the boot-time remount hook"
 mkdir -p /etc/local.d
 cat > /etc/local.d/aios.start <<EOF
 #!/bin/sh
-DEV="\$(blkid -L "$LABEL" 2>/dev/null)"
+DEV="\$(blkid 2>/dev/null | grep 'LABEL="$LABEL"' | head -1 | cut -d: -f1)"
 [ -n "\$DEV" ] || exit 0
 mkdir -p "$MNT"
 mountpoint -q "$MNT" || mount "\$DEV" "$MNT" 2>/dev/null

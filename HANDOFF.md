@@ -140,29 +140,33 @@ build/usb/
     real path writes correctly, ejects, and the result re-verifies clean on a
     fresh attach.
   - This surfaced two real bugs before either shipped — see lessons below.
+- **USB bare-metal boot, the actual MBR/partition-table mechanism — verified
+  in UTM (Virtualize/HVF, real BIOS boot path, not a qemu-independent
+  shortcut).** `/dev/sda3` came up correctly labeled `AIOSDATA`, `vfat`,
+  mountable, on the corrected VM config. `mkusb-mbr.py`'s core claim — that a
+  real firmware boot loader reads the patched MBR and the kernel parses the
+  new partition — is no longer a claim. See "Bootable USB" lessons for the
+  drive-type gotcha that blocked the first attempt.
 
 **Written but NOT verified:**
 - **Local VM** (`build/vm/run-vm.sh`) — blocked on qemu. Syntax-checked only.
 - **VPS deploy** (`build/deploy.sh`) — no box to try it on. The provisioner logic
   was tested locally against a temp prefix.
-- **USB bare-metal boot — the one thing all of the above cannot prove.** Does a
-  real machine's firmware actually find and boot from the patched MBR? Needs
-  qemu (unavailable, confirmed above with a concrete cause) or a real stick in
-  a real machine (out of scope without someone physically present). Everything
-  upstream of "does it boot" is now verified; that one step is not, and no
-  amount of image-inspection substitutes for it. If you try it: report back
-  either way, and if it fails, `mkusb-mbr.py`'s slot-3 assumption is the first
-  thing to question, not the safety gates in `make-usb.sh`.
-- **`provision-usb.sh`'s Alpine mechanics, specifically.** The commands
-  (`blkid -L`, `lbu commit` with `LBU_BACKUPDIR`, the `/etc/local.d` hook,
-  `setup-apkcache`'s actual effect) are grounded in the real `alpine-conf`
-  package source, not memory or blog posts — extracted and read directly this
-  session (see lessons below). What is NOT verified is the boot-time apkovl
-  auto-restore this whole persistence story depends on: every source describes
-  it consistently ("scans all available filesystems for `*.apkovl.tar.gz`"),
-  but that logic lives in the initramfs/mkinitfs boot scripts, which were not
-  pulled and read the way `lbu` itself was. Second-most-likely failure point
-  after the MBR slot, if a real boot doesn't come back clean on reboot.
+- **`provision-usb.sh`'s actual run against a real boot — in progress, not
+  finished.** The `blkid -L` bug (see Bootable USB lessons) was found and
+  fixed mid-session; the fix is verified against the real `blkid` output that
+  VM produced, but has NOT yet been exercised by an actual successful run —
+  the session ended blocked on `mount /dev/sda3 /media/AIOSDATA` returning
+  `Resource busy` with the partition mounted somewhere unlocated. **Resume
+  here**: at the console, run `mount` (no args), find where `/dev/sda3`
+  actually landed, and either run `provision-usb.sh` from that real path or
+  unmount it there and mount at `/media/AIOSDATA` before running it.
+- **Everything past that first successful run.** Whether `lbu commit` actually
+  persists correctly, and whether Alpine's boot-time apkovl auto-restore
+  (documented consistently everywhere, but its actual implementation was never
+  pulled and read the way `lbu`'s source was) brings the stick back on a
+  second boot with no login needed — still entirely unverified, gated on the
+  item above.
 - **Scheduling anywhere but this Mac.** The daemon has not run on Modal or a VPS.
   Modal in particular is serverless — a container stops when you leave, so a
   long-lived `schedd` there is not obviously meaningful. Untried, not designed for.
@@ -266,6 +270,51 @@ means destruction and flags `ls`.
   is exactly the surprise this OS should not spring.
 
 ### Bootable USB
+
+#### Setting up a UTM VM to test it (do this, not qemu)
+
+UTM (already installed, `/Applications/UTM.app`) bundles its own working
+qemu — the Homebrew build trap above doesn't apply to it. This is the actual
+verified path to booting `aios-usb.img` on this Mac.
+
+1. **Build the image**, if `~/Desktop/aios-usb.img` isn't already current:
+   `./build/usb/make-usb.sh --image-only ~/Desktop/aios-usb.img`
+2. UTM → **`+` (New Virtual Machine) → Virtualize** (not Emulate — this Mac is
+   Intel, same arch as the guest, so Virtualize gets HVF acceleration) →
+   **Linux**. Leave the boot-ISO screen blank; finish the wizard.
+3. **VM Settings → Drives**: delete whatever drive the wizard created. **Import
+   Drive** → pick the `.img` file → interface **IDE**.
+4. **The one mistake that cost a whole debugging cycle**: at import, UTM has
+   to be told this is a **Disk Image**, not a **CD/DVD image**. Get this wrong
+   and the guest sees the file as an optical disc (`/dev/sr0`, boots fine via
+   El Torito) with **no MBR parsed at all** — the data partition silently
+   doesn't exist, and everything downstream is inexplicable until you notice
+   `blkid` shows `/dev/sr0` and no `/dev/sda*`. If that happens: shut down,
+   remove the drive, re-import explicitly as a disk image.
+5. Boot it. `login: root`, no password (Alpine live-media default).
+6. `utmctl` (`/Applications/UTM.app/Contents/MacOS/utmctl`) can `list` and
+   `status` VMs by name from a shell. `attach` (redirect serial I/O to a
+   terminal) returned nothing against this VM's default console — it's
+   SPICE/VNC framebuffer, not a real serial device. A **VM Settings → Serial**
+   device would be needed to drive the console from a script/agent instead of
+   typing into the UTM window by hand; not set up this session.
+
+#### The boot sequence, as it actually goes right now
+
+```
+setup-interfaces -a && udhcpc          # network, needed once for apk add python3
+blkid                                  # confirm the AIOSDATA partition and its device node
+sh /media/AIOSDATA/provision-usb.sh    # try this first -- see note below
+```
+
+If that last line says "No such file or directory", the partition isn't
+auto-mounted where expected; mount it by the device node `blkid` showed
+(commonly `/dev/sda3` — see the MBR layout note below for why) and run the
+script from there instead. **Known unresolved as of last session:** mounting
+manually sometimes returns `Resource busy`, meaning something already has it
+mounted somewhere — `mount` (no args) shows every current mount and was the
+next diagnostic step queued when the session ended. Start there.
+
 - **When you can't test the real thing, find the largest piece of it you
   actually can, and test that for real instead of reasoning about all of it.**
   Booting real firmware was never testable this session. Everything upstream
@@ -329,6 +378,32 @@ means destruction and flags `ls`.
   3.22.5. `make-usb.sh` fetches `latest-releases.yaml` fresh every run and
   takes both the filename and the sha256 from it, so there is nothing to go
   stale.
+- **Real firmware boot: verified, in UTM, this session.** `/dev/sda3` came up
+  `LABEL="AIOSDATA" TYPE="vfat"` on the actual first try after fixing the
+  CD/DVD-vs-disk-image mistake below — the MBR patch and everything upstream
+  of it in `mkusb-mbr.py` is now confirmed correct against real (virtualized,
+  HVF-accelerated) BIOS boot, not just structural inspection. This was the one
+  gap no amount of `hdiutil`/`fdisk` checking could close, and it closed clean.
+- **A raw disk image is not automatically a "disk" to the hypervisor.** UTM
+  (and QEMU generally) distinguishes **CD/DVD image** from **Disk Image** at
+  attach time, not just by interface (IDE/SATA/etc). Imported as a CD/DVD,
+  the guest boots the ISO9660 volume via El Torito directly and never parses
+  the MBR at all — `blkid` shows `/dev/sr0`, no `/dev/sda*`, no error, no
+  crash, just a completely absent data partition and an hour of "why can't
+  the kernel see this" before noticing the drive type. Whole-disk `dd`-able
+  hybrid images need to be attached as **disk images specifically**.
+- **BusyBox's `blkid` is not util-linux's `blkid`.** `provision-usb.sh` used
+  `blkid -L "$LABEL"` to find the data partition — works fine with GNU/
+  util-linux tools, silently unsupported by BusyBox's applet (Alpine's live
+  media ships BusyBox). No error, just an empty result, so `find_data_dev()`
+  looked like it was finding nothing when the partition was sitting right
+  there, correctly labeled, per plain `blkid`'s own output. Same lesson as
+  `mount -L` failing the same way one command earlier in the same debugging
+  session — BusyBox reimplements a subset of these tools' flags, not all of
+  them, and only testing on the real target surfaces which subset. Fixed by
+  parsing plain `blkid`'s output (`grep 'LABEL="..."' | cut -d: -f1`) instead
+  of trusting either tool's search flags — verified against the actual
+  `blkid` output this session's VM produced, not a synthetic guess.
 
 ### Modal
 - **Never resolve local paths at module scope.** Modal re-imports the module inside
@@ -404,12 +479,14 @@ means destruction and flags `ls`.
 
 ## Sensible next steps
 
-1. **Boot the USB image on real hardware, or find a working qemu.** This is now
-   the single highest-value next step: `build/usb/make-usb.sh` is written,
-   safety-tested, and structurally verified end to end, but nobody has watched
-   it actually boot. The Mac being pre-T2 helps if it's the test machine.
-   Failing that, a Linux box with a working qemu install would let this be
-   verified without any physical stick at all.
+1. **Finish the live UTM test — get one clean `provision-usb.sh` run.** The
+   hard part (real firmware boots the patched MBR) is done and verified. What's
+   left is mechanical: find where `/dev/sda3` is actually mounted (`mount`, no
+   args — queued but not run when the session ended), get past that, and watch
+   whether `lbu commit` + a reboot actually comes back with no login prompt.
+   See "Bootable USB → Setting up a UTM VM" above for the exact recipe.
+   Only after that: try a real physical stick, and only then does the Mac
+   being pre-T2 start to matter.
 2. **VPS deploy** — still the only untested deploy path that is cheap to verify,
    and now more valuable: it is the always-on box that makes scheduling worth
    having. Nothing about scheduling has been tried on a remote host.
